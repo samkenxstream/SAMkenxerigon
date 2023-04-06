@@ -2,34 +2,35 @@ package calltracer
 
 import (
 	"encoding/binary"
-	"math/big"
 	"sort"
-	"time"
 
+	"github.com/holiman/uint256"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/length"
 	"github.com/ledgerwatch/erigon-lib/kv"
+
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/core/vm"
-	"github.com/ledgerwatch/erigon/crypto"
-	"github.com/ledgerwatch/log/v3"
 )
 
 type CallTracer struct {
-	froms   map[common.Address]struct{}
-	tos     map[common.Address]bool // address -> isCreated
-	hasTEVM func(contractHash common.Hash) (bool, error)
+	froms map[libcommon.Address]struct{}
+	tos   map[libcommon.Address]bool // address -> isCreated
 }
 
-func NewCallTracer(hasTEVM func(contractHash common.Hash) (bool, error)) *CallTracer {
+func NewCallTracer() *CallTracer {
 	return &CallTracer{
-		froms:   make(map[common.Address]struct{}),
-		tos:     make(map[common.Address]bool),
-		hasTEVM: hasTEVM,
+		froms: make(map[libcommon.Address]struct{}),
+		tos:   make(map[libcommon.Address]bool),
 	}
 }
 
-func (ct *CallTracer) CaptureStart(evm *vm.EVM, depth int, from common.Address, to common.Address, precompile bool, create bool, calltype vm.CallType, input []byte, gas uint64, value *big.Int, code []byte) {
+func (ct *CallTracer) CaptureTxStart(gasLimit uint64) {}
+func (ct *CallTracer) CaptureTxEnd(restGas uint64)    {}
+
+// CaptureStart and CaptureEnter also capture SELFDESTRUCT opcode invocations
+func (ct *CallTracer) captureStartOrEnter(from, to libcommon.Address, create bool, code []byte) {
 	ct.froms[from] = struct{}{}
 
 	created, ok := ct.tos[to]
@@ -38,33 +39,25 @@ func (ct *CallTracer) CaptureStart(evm *vm.EVM, depth int, from common.Address, 
 	}
 
 	if !created && create {
-		if len(code) > 0 && ct.hasTEVM != nil {
-			has, err := ct.hasTEVM(common.BytesToHash(crypto.Keccak256(code)))
-			if !has {
-				ct.tos[to] = true
-			}
-
-			if err != nil {
-				log.Warn("while CaptureStart", "err", err)
-			}
+		if len(code) > 0 {
+			ct.tos[to] = true
 		}
 	}
 }
-func (ct *CallTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, rData []byte, depth int, err error) {
+
+func (ct *CallTracer) CaptureStart(env vm.VMInterface, from libcommon.Address, to libcommon.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
+	ct.captureStartOrEnter(from, to, create, code)
 }
-func (ct *CallTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, depth int, err error) {
+func (ct *CallTracer) CaptureEnter(typ vm.OpCode, from libcommon.Address, to libcommon.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
+	ct.captureStartOrEnter(from, to, create, code)
 }
-func (ct *CallTracer) CaptureEnd(depth int, output []byte, startGas, endGas uint64, t time.Duration, err error) {
+func (ct *CallTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, rData []byte, depth int, err error) {
 }
-func (ct *CallTracer) CaptureSelfDestruct(from common.Address, to common.Address, value *big.Int) {
-	ct.froms[from] = struct{}{}
-	ct.tos[to] = false
+func (ct *CallTracer) CaptureFault(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, depth int, err error) {
 }
-func (ct *CallTracer) CaptureAccountRead(account common.Address) error {
-	return nil
+func (ct *CallTracer) CaptureEnd(output []byte, usedGas uint64, err error) {
 }
-func (ct *CallTracer) CaptureAccountWrite(account common.Address) error {
-	return nil
+func (ct *CallTracer) CaptureExit(output []byte, usedGas uint64, err error) {
 }
 
 func (ct *CallTracer) WriteToDb(tx kv.StatelessWriteTx, block *types.Block, vmConfig vm.Config) error {
@@ -86,8 +79,7 @@ func (ct *CallTracer) WriteToDb(tx kv.StatelessWriteTx, block *types.Block, vmCo
 	// List may contain duplicates
 	var blockNumEnc [8]byte
 	binary.BigEndian.PutUint64(blockNumEnc[:], block.Number().Uint64())
-	var prev common.Address
-	var created bool
+	var prev libcommon.Address
 	for j, addr := range list {
 		if j > 0 && prev == addr {
 			continue
@@ -99,12 +91,6 @@ func (ct *CallTracer) WriteToDb(tx kv.StatelessWriteTx, block *types.Block, vmCo
 		}
 		if _, ok := ct.tos[addr]; ok {
 			v[length.Addr] |= 2
-		}
-		// TEVM marking still untranslated contracts
-		if vmConfig.EnableTEMV {
-			if created = ct.tos[addr]; created {
-				v[length.Addr] |= 4
-			}
 		}
 		if j == 0 {
 			if err := tx.Append(kv.CallTraceSet, blockNumEnc[:], v[:]); err != nil {

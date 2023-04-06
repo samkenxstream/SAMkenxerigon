@@ -1,20 +1,19 @@
 package stagedsync
 
 import (
-	"bytes"
-	"context"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
 	"time"
 
 	mapset "github.com/deckarep/golang-set"
+	"github.com/ledgerwatch/erigon-lib/chain"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/log/v3"
+
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/txpool"
-	types2 "github.com/ledgerwatch/erigon-lib/types"
-	"github.com/ledgerwatch/erigon/common"
+
 	"github.com/ledgerwatch/erigon/common/debug"
 	"github.com/ledgerwatch/erigon/consensus"
 	"github.com/ledgerwatch/erigon/core"
@@ -23,25 +22,22 @@ import (
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/eth/ethutils"
 	"github.com/ledgerwatch/erigon/params"
-	"github.com/ledgerwatch/erigon/rlp"
-	"github.com/ledgerwatch/log/v3"
 )
 
 type MiningBlock struct {
-	Header   *types.Header
-	Uncles   []*types.Header
-	Txs      types.Transactions
-	Receipts types.Receipts
-
-	LocalTxs  types.TransactionsStream
-	RemoteTxs types.TransactionsStream
+	Header      *types.Header
+	Uncles      []*types.Header
+	Txs         types.Transactions
+	Receipts    types.Receipts
+	Withdrawals []*types.Withdrawal
+	PreparedTxs types.TransactionsStream
 }
 
 type MiningState struct {
 	MiningConfig      *params.MiningConfig
 	PendingResultCh   chan *types.Block
 	MiningResultCh    chan *types.Block
-	MiningResultPOSCh chan *types.Block
+	MiningResultPOSCh chan *types.BlockWithReceipts
 	MiningBlock       *MiningBlock
 }
 
@@ -59,7 +55,7 @@ func NewProposingState(cfg *params.MiningConfig) MiningState {
 		MiningConfig:      cfg,
 		PendingResultCh:   make(chan *types.Block, 1),
 		MiningResultCh:    make(chan *types.Block, 1),
-		MiningResultPOSCh: make(chan *types.Block, 1),
+		MiningResultPOSCh: make(chan *types.BlockWithReceipts, 1),
 		MiningBlock:       &MiningBlock{},
 	}
 }
@@ -67,7 +63,7 @@ func NewProposingState(cfg *params.MiningConfig) MiningState {
 type MiningCreateBlockCfg struct {
 	db                     kv.RwDB
 	miner                  MiningState
-	chainConfig            params.ChainConfig
+	chainConfig            chain.Config
 	engine                 consensus.Engine
 	txPool2                *txpool.TxPool
 	txPool2DB              kv.RoDB
@@ -75,7 +71,7 @@ type MiningCreateBlockCfg struct {
 	blockBuilderParameters *core.BlockBuilderParameters
 }
 
-func StageMiningCreateBlockCfg(db kv.RwDB, miner MiningState, chainConfig params.ChainConfig, engine consensus.Engine, txPool2 *txpool.TxPool, txPool2DB kv.RoDB, blockBuilderParameters *core.BlockBuilderParameters, tmpdir string) MiningCreateBlockCfg {
+func StageMiningCreateBlockCfg(db kv.RwDB, miner MiningState, chainConfig chain.Config, engine consensus.Engine, txPool2 *txpool.TxPool, txPool2DB kv.RoDB, blockBuilderParameters *core.BlockBuilderParameters, tmpdir string) MiningCreateBlockCfg {
 	return MiningCreateBlockCfg{
 		db:                     db,
 		miner:                  miner,
@@ -88,12 +84,14 @@ func StageMiningCreateBlockCfg(db kv.RwDB, miner MiningState, chainConfig params
 	}
 }
 
+var maxTransactions uint16 = 1000
+
 // SpawnMiningCreateBlockStage
 // TODO:
 // - resubmitAdjustCh - variable is not implemented
 func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBlockCfg, quit <-chan struct{}) (err error) {
 	current := cfg.miner.MiningBlock
-	txPoolLocals := []common.Address{} //txPoolV2 has no concept of local addresses (yet?)
+	txPoolLocals := []libcommon.Address{} //txPoolV2 has no concept of local addresses (yet?)
 	coinbase := cfg.miner.MiningConfig.Etherbase
 
 	const (
@@ -115,7 +113,7 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 		return fmt.Errorf("wrong head block: %x (current) vs %x (requested)", parent.Hash(), cfg.blockBuilderParameters.ParentHash)
 	}
 
-	if cfg.miner.MiningConfig.Etherbase == (common.Address{}) {
+	if cfg.miner.MiningConfig.Etherbase == (libcommon.Address{}) {
 		if cfg.blockBuilderParameters == nil {
 			return fmt.Errorf("refusing to mine without etherbase")
 		}
@@ -124,48 +122,13 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 	}
 
 	blockNum := executionAt + 1
-	var txs []types.Transaction
-	if err = cfg.txPool2DB.View(context.Background(), func(tx kv.Tx) error {
-		txSlots := types2.TxsRlp{}
-		if err := cfg.txPool2.Best(200, &txSlots, tx); err != nil {
-			return err
-		}
 
-		for i := range txSlots.Txs {
-			s := rlp.NewStream(bytes.NewReader(txSlots.Txs[i]), uint64(len(txSlots.Txs[i])))
-
-			transaction, err := types.DecodeTransaction(s)
-			if err == io.EOF {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if transaction.GetChainID().ToBig().Cmp(cfg.chainConfig.ChainID) != 0 {
-				continue
-			}
-			txs = append(txs, transaction)
-		}
-		var sender common.Address
-		for i := range txs {
-			copy(sender[:], txSlots.Senders.At(i))
-			txs[i].SetSender(sender)
-		}
-
-		return nil
-	}); err != nil {
-		return err
-	}
-	current.RemoteTxs = types.NewTransactionsFixedOrder(txs)
-	// txpool v2 - doesn't prioritise local txs over remote
-	current.LocalTxs = types.NewTransactionsFixedOrder(nil)
-	log.Debug(fmt.Sprintf("[%s] Candidate txs", logPrefix), "amount", len(txs))
 	localUncles, remoteUncles, err := readNonCanonicalHeaders(tx, blockNum, cfg.engine, coinbase, txPoolLocals)
 	if err != nil {
 		return err
 	}
 	chain := ChainReader{Cfg: cfg.chainConfig, Db: tx}
-	var GetBlocksFromHash = func(hash common.Hash, n int) (blocks []*types.Block) {
+	var GetBlocksFromHash = func(hash libcommon.Hash, n int) (blocks []*types.Block) {
 		number := rawdb.ReadHeaderNumber(tx, hash)
 		if number == nil {
 			return nil
@@ -233,6 +196,7 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 
 		current.Header = header
 		current.Uncles = nil
+		current.Withdrawals = cfg.blockBuilderParameters.Withdrawals
 		return nil
 	}
 
@@ -241,12 +205,7 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 		// Check whether the block is among the fork extra-override range
 		limit := new(big.Int).Add(daoBlock, params.DAOForkExtraRange)
 		if header.Number.Cmp(daoBlock) >= 0 && header.Number.Cmp(limit) < 0 {
-			// Depending whether we support or oppose the fork, override differently
-			if cfg.chainConfig.DAOForkSupport {
-				header.Extra = libcommon.Copy(params.DAOForkBlockExtra)
-			} else if bytes.Equal(header.Extra, params.DAOForkBlockExtra) {
-				header.Extra = []byte{} // If miner opposes, don't let it use the reserved extra-data
-			}
+			header.Extra = libcommon.Copy(params.DAOForkBlockExtra)
 		}
 	}
 
@@ -254,7 +213,7 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 	var makeUncles = func(proposedUncles mapset.Set) []*types.Header {
 		var uncles []*types.Header
 		proposedUncles.Each(func(item interface{}) bool {
-			hash, ok := item.(common.Hash)
+			hash, ok := item.(libcommon.Hash)
 			if !ok {
 				return false
 			}
@@ -301,7 +260,7 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 	// Accumulate the miningUncles for the env block
 	// Prefer to locally generated uncle
 	uncles := make([]*types.Header, 0, 2)
-	for _, blocks := range []map[common.Hash]*types.Header{localUncles, remoteUncles} {
+	for _, blocks := range []map[libcommon.Hash]*types.Header{localUncles, remoteUncles} {
 		// Clean up stale uncle blocks first
 		for hash, uncle := range blocks {
 			if uncle.Number.Uint64()+staleThreshold <= header.Number.Uint64() {
@@ -323,11 +282,12 @@ func SpawnMiningCreateBlockStage(s *StageState, tx kv.RwTx, cfg MiningCreateBloc
 
 	current.Header = header
 	current.Uncles = makeUncles(env.uncles)
+	current.Withdrawals = nil
 	return nil
 }
 
-func readNonCanonicalHeaders(tx kv.Tx, blockNum uint64, engine consensus.Engine, coinbase common.Address, txPoolLocals []common.Address) (localUncles, remoteUncles map[common.Hash]*types.Header, err error) {
-	localUncles, remoteUncles = map[common.Hash]*types.Header{}, map[common.Hash]*types.Header{}
+func readNonCanonicalHeaders(tx kv.Tx, blockNum uint64, engine consensus.Engine, coinbase libcommon.Address, txPoolLocals []libcommon.Address) (localUncles, remoteUncles map[libcommon.Hash]*types.Header, err error) {
+	localUncles, remoteUncles = map[libcommon.Hash]*types.Header{}, map[libcommon.Hash]*types.Header{}
 	nonCanonicalBlocks, err := rawdb.ReadHeadersByNumber(tx, blockNum)
 	if err != nil {
 		return

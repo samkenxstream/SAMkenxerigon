@@ -16,6 +16,10 @@ on:
       - synchronize
       - ready_for_review
 
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     if: ${{ github.event_name == 'push' || !github.event.pull_request.draft }}
@@ -26,22 +30,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
-      - run: git submodule update --init --recursive --force
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
-          go-version: 1.18.x
+          go-version: '1.19'
       - name: Install dependencies on Linux
         if: runner.os == 'Linux'
         run: sudo apt update && sudo apt install build-essential
-
-      - uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/Library/Caches/go-build
-            ~/go/pkg/mod
-          key: go-${{ matrix.os }}-${{ hashFiles('**/go.sum') }}
-          restore-keys: go-${{ matrix.os }}-
 
       - name: Build
         run: make all
@@ -60,7 +54,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: golangci/golangci-lint-action@v3
         with:
-          version: v1.48
+          version: v1.52
 
       - name: Test
         run: make test
@@ -74,10 +68,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
-      - run: git submodule update --init --recursive --force
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
-          go-version: 1.18.x
+          go-version: '1.19'
 
       - uses: actions/cache@v3
         with:
@@ -90,63 +83,35 @@ jobs:
           choco upgrade mingw -y --no-progress --version 11.2.0.07112021
           choco install cmake -y --no-progress --version 3.23.1
 
-      - uses: actions/cache@v3
-        with:
-          path: |
-            ~\AppData\Local\go-build
-            ~\go\pkg\mod
-          key: go-${{ matrix.os }}-${{ hashFiles('**/go.sum') }}
-          restore-keys: go-${{ matrix.os }}-
-
       - name: Build
         run: .\wmake.ps1 all
 
       - name: Test
         run: .\wmake.ps1 test
 
-  docker:
-    if: ${{ github.event_name == 'push' || !github.event.pull_request.draft }}
+  docker-build-check:
+    # don't run this on devel - the PR must have run it to be merged and it misleads that this pushes the docker image
+    if: (${{ github.event_name == 'push' || !github.event.pull_request.draft }}) && ${{ github.ref != 'refs/heads/devel' }}
     runs-on: ubuntu-20.04
     steps:
+      - uses: AutoModality/action-clean@v1
       - uses: actions/checkout@v3
         with:
           fetch-depth: 0 # fetch git tags for "git describe"
 
-      - name: make docker
+      - name: make docker (see dockerhub for image builds)
         run: DOCKER_TAG=thorax/erigon:ci-$GITHUB_SHA DOCKER_UID=$(id -u) DOCKER_GID=$(id -g) make docker
 
       # check with root permissions, should be cached from previous build
       - name: sudo make docker
         run: sudo DOCKER_TAG=thorax/erigon:ci-$GITHUB_SHA DOCKER_UID=$(id -u) DOCKER_GID=$(id -g) make docker
+  
+  automated-tests:
+    runs-on:
+      ubuntu-20.04
+    if: ${{ github.event_name == 'push' || !github.event.pull_request.draft }}
+    steps:
+      - uses: actions/checkout@v3
 
-  hive:
-     needs:
-       - tests
-       - tests-windows
-       - docker
-     runs-on: ubuntu-20.04
-     if: ${{ github.event_name == 'push' || !github.event.pull_request.draft }}
-     steps:
-       - uses: actions/checkout@v3
-         with:
-           fetch-depth: 0 # fetch git tags for "git describe"
-
-       - name: build erigon image
-         run: DOCKER_TAG=thorax/erigon:ci-$GITHUB_SHA DOCKER_UID=$(id -u) DOCKER_GID=$(id -g) make docker
-
-       # check with root permissions, should be cached from previous build
-       - name: build erigon image (root permissions)
-         run: sudo DOCKER_TAG=thorax/erigon:ci-$GITHUB_SHA DOCKER_UID=$(id -u) DOCKER_GID=$(id -g) make docker
-
-       - name: run hive
-         run: sudo mkdir /results && docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v ${{ github.workspace }}:/work thorax/hive:latest --sim ethereum/engine --results-root=/work/results --client erigon_ci-$GITHUB_SHA --docker.output --loglevel 5
-
-       - name: parse hive output
-         run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v ${{ github.workspace }}:/work --entrypoint /app/hivecioutput thorax/hive:latest --resultsdir=/work/results --outdir=/work/results
-
-       - name: archive hive results
-         uses: actions/upload-artifact@v3
-         if: always()
-         with:
-           name: test-results
-           path: results/*.xml
+      - name: run automated testing
+        run: BUILD_ERIGON=1 ./tests/automated-testing/run.sh

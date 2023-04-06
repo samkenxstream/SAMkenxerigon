@@ -27,9 +27,9 @@ import (
 	"testing"
 
 	"github.com/gorilla/websocket"
-	"github.com/ledgerwatch/erigon/internal/testlog"
 	"github.com/ledgerwatch/erigon/rpc"
 	"github.com/ledgerwatch/erigon/rpc/rpccfg"
+	"github.com/ledgerwatch/erigon/turbo/testlog"
 	"github.com/ledgerwatch/log/v3"
 
 	"github.com/stretchr/testify/assert"
@@ -324,7 +324,7 @@ func rpcRequest(t *testing.T, url string, extraHeaders ...string) *http.Response
 	}
 	for i := 0; i < len(extraHeaders); i += 2 {
 		key, value := extraHeaders[i], extraHeaders[i+1]
-		if strings.ToLower(key) == "host" {
+		if strings.EqualFold(key, "host") {
 			req.Host = value
 		} else {
 			req.Header.Set(key, value)

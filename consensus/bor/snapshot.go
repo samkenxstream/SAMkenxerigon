@@ -5,21 +5,22 @@ import (
 	"context"
 	"encoding/json"
 
-	lru "github.com/hashicorp/golang-lru"
+	"github.com/hashicorp/golang-lru/v2"
+	"github.com/ledgerwatch/erigon-lib/chain"
+	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/common"
+	"github.com/ledgerwatch/erigon/consensus/bor/valset"
 	"github.com/ledgerwatch/erigon/core/types"
-	"github.com/ledgerwatch/erigon/params"
 )
 
 // Snapshot is the state of the authorization voting at a given point in time.
 type Snapshot struct {
-	config   *params.BorConfig // Consensus engine parameters to fine tune behavior
-	sigcache *lru.ARCCache     // Cache of recent block signatures to speed up ecrecover
+	config   *chain.BorConfig                           // Consensus engine parameters to fine tune behavior
+	sigcache *lru.ARCCache[common.Hash, common.Address] // Cache of recent block signatures to speed up ecrecover
 
 	Number       uint64                    `json:"number"`       // Block number where the snapshot was created
 	Hash         common.Hash               `json:"hash"`         // Block hash where the snapshot was created
-	ValidatorSet *ValidatorSet             `json:"validatorSet"` // Validator set at this moment
+	ValidatorSet *valset.ValidatorSet      `json:"validatorSet"` // Validator set at this moment
 	Recents      map[uint64]common.Address `json:"recents"`      // Set of recent signers for spam protections
 }
 
@@ -36,43 +37,50 @@ const BorSeparate = "BorSeparate"
 // method does not initialize the set of recent signers, so only ever use if for
 // the genesis block.
 func newSnapshot(
-	config *params.BorConfig,
-	sigcache *lru.ARCCache,
+	config *chain.BorConfig,
+	sigcache *lru.ARCCache[common.Hash, common.Address],
 	number uint64,
 	hash common.Hash,
-	validators []*Validator,
+	validators []*valset.Validator,
 ) *Snapshot {
 	snap := &Snapshot{
 		config:       config,
 		sigcache:     sigcache,
 		Number:       number,
 		Hash:         hash,
-		ValidatorSet: NewValidatorSet(validators),
+		ValidatorSet: valset.NewValidatorSet(validators),
 		Recents:      make(map[uint64]common.Address),
 	}
 	return snap
 }
 
 // loadSnapshot loads an existing snapshot from the database.
-func loadSnapshot(config *params.BorConfig, sigcache *lru.ARCCache, db kv.RwDB, hash common.Hash) (*Snapshot, error) {
+func loadSnapshot(config *chain.BorConfig, sigcache *lru.ARCCache[common.Hash, common.Address], db kv.RwDB, hash common.Hash) (*Snapshot, error) {
 	tx, err := db.BeginRo(context.Background())
 	if err != nil {
 		return nil, err
 	}
+
 	defer tx.Rollback()
+
 	blob, err := tx.GetOne(kv.BorSeparate, append([]byte("bor-"), hash[:]...))
 	if err != nil {
 		return nil, err
 	}
+
 	snap := new(Snapshot)
+
 	if err := json.Unmarshal(blob, snap); err != nil {
 		return nil, err
 	}
+
+	snap.ValidatorSet.UpdateValidatorMap()
+
 	snap.config = config
 	snap.sigcache = sigcache
 
 	// update total voting power
-	if err := snap.ValidatorSet.updateTotalVotingPower(); err != nil {
+	if err := snap.ValidatorSet.UpdateTotalVotingPower(); err != nil {
 		return nil, err
 	}
 
@@ -119,6 +127,7 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 			return nil, errOutOfRangeChain
 		}
 	}
+
 	if headers[0].Number.Uint64() != s.Number+1 {
 		return nil, errOutOfRangeChain
 	}
@@ -130,8 +139,8 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 		number := header.Number.Uint64()
 
 		// Delete the oldest signer from the recent list to allow it signing again
-		if number >= s.config.Sprint {
-			delete(snap.Recents, number-s.config.Sprint)
+		if number >= s.config.CalculateSprint(number) {
+			delete(snap.Recents, number-s.config.CalculateSprint(number))
 		}
 
 		// Resolve the authorization key and check against signers
@@ -141,7 +150,7 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 		}
 
 		// check if signer is in validator set
-		if !snap.ValidatorSet.HasAddress(signer.Bytes()) {
+		if !snap.ValidatorSet.HasAddress(signer) {
 			return nil, &UnauthorizedSignerError{number, signer.Bytes()}
 		}
 
@@ -153,19 +162,20 @@ func (s *Snapshot) apply(headers []*types.Header) (*Snapshot, error) {
 		snap.Recents[number] = signer
 
 		// change validator set and change proposer
-		if number > 0 && (number+1)%s.config.Sprint == 0 {
+		if number > 0 && (number+1)%s.config.CalculateSprint(number) == 0 {
 			if err := validateHeaderExtraField(header.Extra); err != nil {
 				return nil, err
 			}
 			validatorBytes := header.Extra[extraVanity : len(header.Extra)-extraSeal]
 
 			// get validators from headers and use that for new validator set
-			newVals, _ := ParseValidators(validatorBytes)
+			newVals, _ := valset.ParseValidators(validatorBytes)
 			v := getUpdatedValidatorSet(snap.ValidatorSet.Copy(), newVals)
 			v.IncrementProposerPriority(1)
 			snap.ValidatorSet = v
 		}
 	}
+
 	snap.Number += uint64(len(headers))
 	snap.Hash = headers[len(headers)-1].Hash()
 
@@ -177,10 +187,13 @@ func (s *Snapshot) GetSignerSuccessionNumber(signer common.Address) (int, error)
 	validators := s.ValidatorSet.Validators
 	proposer := s.ValidatorSet.GetProposer().Address
 	proposerIndex, _ := s.ValidatorSet.GetByAddress(proposer)
+
 	if proposerIndex == -1 {
 		return -1, &UnauthorizedProposerError{s.Number, proposer.Bytes()}
 	}
+
 	signerIndex, _ := s.ValidatorSet.GetByAddress(signer)
+
 	if signerIndex == -1 {
 		return -1, &UnauthorizedSignerError{s.Number, signer.Bytes()}
 	}
@@ -191,6 +204,7 @@ func (s *Snapshot) GetSignerSuccessionNumber(signer common.Address) (int, error)
 			tempIndex = tempIndex + len(validators)
 		}
 	}
+
 	return tempIndex - proposerIndex, nil
 }
 
@@ -200,6 +214,7 @@ func (s *Snapshot) signers() []common.Address {
 	for _, sig := range s.ValidatorSet.Validators {
 		sigs = append(sigs, sig.Address)
 	}
+
 	return sigs
 }
 

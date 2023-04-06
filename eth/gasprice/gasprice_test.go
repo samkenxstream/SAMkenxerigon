@@ -23,8 +23,12 @@ import (
 	"testing"
 
 	"github.com/holiman/uint256"
+	"github.com/ledgerwatch/erigon-lib/chain"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/common"
+	"github.com/ledgerwatch/erigon/eth/gasprice/gaspricecfg"
+
+	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/commands"
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/types"
@@ -37,10 +41,10 @@ import (
 
 type testBackend struct {
 	db  kv.RwDB
-	cfg *params.ChainConfig
+	cfg *chain.Config
 }
 
-func (b *testBackend) GetReceipts(ctx context.Context, hash common.Hash) (types.Receipts, error) {
+func (b *testBackend) GetReceipts(ctx context.Context, hash libcommon.Hash) (types.Receipts, error) {
 	tx, err := b.db.BeginRo(context.Background())
 	if err != nil {
 		return nil, err
@@ -80,7 +84,7 @@ func (b *testBackend) BlockByNumber(ctx context.Context, number rpc.BlockNumber)
 	return rawdb.ReadBlockByNumber(tx, uint64(number))
 }
 
-func (b *testBackend) ChainConfig() *params.ChainConfig {
+func (b *testBackend) ChainConfig() *chain.Config {
 	return b.cfg
 }
 
@@ -88,9 +92,9 @@ func newTestBackend(t *testing.T) *testBackend {
 	var (
 		key, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 		addr   = crypto.PubkeyToAddress(key.PublicKey)
-		gspec  = &core.Genesis{
+		gspec  = &types.Genesis{
 			Config: params.TestChainConfig,
-			Alloc:  core.GenesisAlloc{addr: {Balance: big.NewInt(math.MaxInt64)}},
+			Alloc:  types.GenesisAlloc{addr: {Balance: big.NewInt(math.MaxInt64)}},
 		}
 		signer = types.LatestSigner(gspec.Config)
 	)
@@ -98,8 +102,8 @@ func newTestBackend(t *testing.T) *testBackend {
 
 	// Generate testing blocks
 	chain, err := core.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 32, func(i int, b *core.BlockGen) {
-		b.SetCoinbase(common.Address{1})
-		tx, txErr := types.SignTx(types.NewTransaction(b.TxNonce(addr), common.HexToAddress("deadbeef"), uint256.NewInt(100), 21000, uint256.NewInt(uint64(int64(i+1)*params.GWei)), nil), *signer, key)
+		b.SetCoinbase(libcommon.Address{1})
+		tx, txErr := types.SignTx(types.NewTransaction(b.TxNonce(addr), libcommon.HexToAddress("deadbeef"), uint256.NewInt(100), 21000, uint256.NewInt(uint64(int64(i+1)*params.GWei)), nil), *signer, key)
 		if txErr != nil {
 			t.Fatalf("failed to create tx: %v", txErr)
 		}
@@ -138,13 +142,14 @@ func (b *testBackend) GetBlockByNumber(number uint64) *types.Block {
 }
 
 func TestSuggestPrice(t *testing.T) {
-	config := gasprice.Config{
+	config := gaspricecfg.Config{
 		Blocks:     2,
 		Percentile: 60,
 		Default:    big.NewInt(params.GWei),
 	}
 	backend := newTestBackend(t)
-	oracle := gasprice.NewOracle(backend, config)
+	cache := commands.NewGasPriceCache()
+	oracle := gasprice.NewOracle(backend, config, cache)
 
 	// The gas price sampled is: 32G, 31G, 30G, 29G, 28G, 27G
 	got, err := oracle.SuggestTipCap(context.Background())

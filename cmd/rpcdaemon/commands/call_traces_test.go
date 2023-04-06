@@ -1,20 +1,21 @@
 package commands
 
 import (
-	"bytes"
 	"context"
 	"sync"
 	"testing"
 
 	"github.com/holiman/uint256"
 	jsoniter "github.com/json-iterator/go"
+	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/kv/kvcache"
-	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/cli/httpcfg"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
 
-	"github.com/ledgerwatch/erigon/common"
+	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/cli/httpcfg"
+	"github.com/ledgerwatch/erigon/rpc/rpccfg"
+
 	"github.com/ledgerwatch/erigon/common/hexutil"
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/types"
@@ -23,6 +24,7 @@ import (
 )
 
 func blockNumbersFromTraces(t *testing.T, b []byte) []int {
+	t.Helper()
 	var err error
 	var p fastjson.Parser
 	response := b
@@ -34,7 +36,7 @@ func blockNumbersFromTraces(t *testing.T, b []byte) []int {
 	if elems, err = v.Array(); err != nil {
 		t.Fatalf("expected array in the response: %v", err)
 	}
-	var numbers []int
+	numbers := make([]int, 0, len(elems))
 	for _, elem := range elems {
 		bn := elem.GetInt("blockNumber")
 		numbers = append(numbers, bn)
@@ -44,15 +46,17 @@ func blockNumbersFromTraces(t *testing.T, b []byte) []int {
 
 func TestCallTraceOneByOne(t *testing.T) {
 	m := stages.Mock(t)
-	defer m.DB.Close()
 	chain, err := core.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 10, func(i int, gen *core.BlockGen) {
 		gen.SetCoinbase(common.Address{1})
 	}, false /* intermediateHashes */)
 	if err != nil {
 		t.Fatalf("generate chain: %v", err)
 	}
+
+	agg := m.HistoryV3Components()
+	br := snapshotsync.NewBlockReaderWithSnapshots(m.BlockSnapshots, m.TransactionsV3)
 	api := NewTraceAPI(
-		NewBaseApi(nil, kvcache.New(kvcache.DefaultCoherentConfig), snapshotsync.NewBlockReader(), nil, nil, false),
+		NewBaseApi(nil, kvcache.New(kvcache.DefaultCoherentConfig), br, agg, false, rpccfg.DefaultEvmCallTimeout, m.Engine, m.Dirs),
 		m.DB, &httpcfg.HttpCfg{})
 	// Insert blocks 1 by 1, to tirgget possible "off by one" errors
 	for i := 0; i < chain.Length(); i++ {
@@ -79,7 +83,6 @@ func TestCallTraceOneByOne(t *testing.T) {
 
 func TestCallTraceUnwind(t *testing.T) {
 	m := stages.Mock(t)
-	defer m.DB.Close()
 	var chainA, chainB *core.ChainPack
 	var err error
 	chainA, err = core.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 10, func(i int, gen *core.BlockGen) {
@@ -98,12 +101,16 @@ func TestCallTraceUnwind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate chainB: %v", err)
 	}
-	api := NewTraceAPI(NewBaseApi(nil, kvcache.New(kvcache.DefaultCoherentConfig), snapshotsync.NewBlockReader(), nil, nil, false), m.DB, &httpcfg.HttpCfg{})
+
+	agg := m.HistoryV3Components()
+	br := snapshotsync.NewBlockReaderWithSnapshots(m.BlockSnapshots, m.TransactionsV3)
+	api := NewTraceAPI(NewBaseApi(nil, kvcache.New(kvcache.DefaultCoherentConfig), br, agg, false, rpccfg.DefaultEvmCallTimeout, m.Engine, m.Dirs), m.DB, &httpcfg.HttpCfg{})
+
 	if err = m.InsertChain(chainA); err != nil {
 		t.Fatalf("inserting chainA: %v", err)
 	}
-	var buf bytes.Buffer
-	stream := jsoniter.NewStream(jsoniter.ConfigDefault, &buf, 4096)
+	stream := jsoniter.ConfigDefault.BorrowStream(nil)
+	defer jsoniter.ConfigDefault.ReturnStream(stream)
 	var fromBlock, toBlock uint64
 	fromBlock = 1
 	toBlock = 10
@@ -116,12 +123,12 @@ func TestCallTraceUnwind(t *testing.T) {
 	if err = api.Filter(context.Background(), traceReq1, stream); err != nil {
 		t.Fatalf("trace_filter failed: %v", err)
 	}
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, blockNumbersFromTraces(t, stream.Buffer()))
 
-	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, blockNumbersFromTraces(t, buf.Bytes()))
 	if err = m.InsertChain(chainB.Slice(0, 12)); err != nil {
 		t.Fatalf("inserting chainB: %v", err)
 	}
-	buf.Reset()
+	stream.Reset(nil)
 	toBlock = 12
 	traceReq2 := TraceFilterRequest{
 		FromBlock: (*hexutil.Uint64)(&fromBlock),
@@ -131,11 +138,12 @@ func TestCallTraceUnwind(t *testing.T) {
 	if err = api.Filter(context.Background(), traceReq2, stream); err != nil {
 		t.Fatalf("trace_filter failed: %v", err)
 	}
-	assert.Equal(t, []int{1, 2, 3, 4, 5, 11, 12}, blockNumbersFromTraces(t, buf.Bytes()))
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 11, 12}, blockNumbersFromTraces(t, stream.Buffer()))
+
 	if err = m.InsertChain(chainB.Slice(12, 20)); err != nil {
 		t.Fatalf("inserting chainB: %v", err)
 	}
-	buf.Reset()
+	stream.Reset(nil)
 	fromBlock = 12
 	toBlock = 20
 	traceReq3 := TraceFilterRequest{
@@ -146,27 +154,28 @@ func TestCallTraceUnwind(t *testing.T) {
 	if err = api.Filter(context.Background(), traceReq3, stream); err != nil {
 		t.Fatalf("trace_filter failed: %v", err)
 	}
-	assert.Equal(t, []int{12, 13, 14, 15, 16, 17, 18, 19, 20}, blockNumbersFromTraces(t, buf.Bytes()))
+	assert.Equal(t, []int{12, 13, 14, 15, 16, 17, 18, 19, 20}, blockNumbersFromTraces(t, stream.Buffer()))
 }
 
 func TestFilterNoAddresses(t *testing.T) {
 	m := stages.Mock(t)
-	defer m.DB.Close()
 	chain, err := core.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 10, func(i int, gen *core.BlockGen) {
 		gen.SetCoinbase(common.Address{1})
 	}, false /* intermediateHashes */)
 	if err != nil {
 		t.Fatalf("generate chain: %v", err)
 	}
-	api := NewTraceAPI(NewBaseApi(nil, kvcache.New(kvcache.DefaultCoherentConfig), snapshotsync.NewBlockReader(), nil, nil, false), m.DB, &httpcfg.HttpCfg{})
+	agg := m.HistoryV3Components()
+	br := snapshotsync.NewBlockReaderWithSnapshots(m.BlockSnapshots, m.TransactionsV3)
+	api := NewTraceAPI(NewBaseApi(nil, kvcache.New(kvcache.DefaultCoherentConfig), br, agg, false, rpccfg.DefaultEvmCallTimeout, m.Engine, m.Dirs), m.DB, &httpcfg.HttpCfg{})
 	// Insert blocks 1 by 1, to tirgget possible "off by one" errors
 	for i := 0; i < chain.Length(); i++ {
 		if err = m.InsertChain(chain.Slice(i, i+1)); err != nil {
 			t.Fatalf("inserting chain: %v", err)
 		}
 	}
-	var buf bytes.Buffer
-	stream := jsoniter.NewStream(jsoniter.ConfigDefault, &buf, 4096)
+	stream := jsoniter.ConfigDefault.BorrowStream(nil)
+	defer jsoniter.ConfigDefault.ReturnStream(stream)
 	var fromBlock, toBlock uint64
 	fromBlock = 1
 	toBlock = 10
@@ -177,14 +186,14 @@ func TestFilterNoAddresses(t *testing.T) {
 	if err = api.Filter(context.Background(), traceReq1, stream); err != nil {
 		t.Fatalf("trace_filter failed: %v", err)
 	}
-	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, blockNumbersFromTraces(t, buf.Bytes()))
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, blockNumbersFromTraces(t, stream.Buffer()))
 }
 
 func TestFilterAddressIntersection(t *testing.T) {
 	m := stages.Mock(t)
-	defer m.DB.Close()
-
-	api := NewTraceAPI(NewBaseApi(nil, kvcache.New(kvcache.DefaultCoherentConfig), snapshotsync.NewBlockReader(), nil, nil, false), m.DB, &httpcfg.HttpCfg{})
+	agg := m.HistoryV3Components()
+	br := snapshotsync.NewBlockReaderWithSnapshots(m.BlockSnapshots, m.TransactionsV3)
+	api := NewTraceAPI(NewBaseApi(nil, kvcache.New(kvcache.DefaultCoherentConfig), br, agg, false, rpccfg.DefaultEvmCallTimeout, m.Engine, m.Dirs), m.DB, &httpcfg.HttpCfg{})
 
 	toAddress1, toAddress2, other := common.Address{1}, common.Address{2}, common.Address{3}
 

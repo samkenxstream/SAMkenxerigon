@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/c2h5oh/datasize"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/mdbx"
 
@@ -82,10 +83,10 @@ type DB struct {
 
 // OpenDB opens a node database for storing and retrieving infos about known peers in the
 // network. If no path is given an in-memory, temporary database is constructed.
-func OpenDB(path string) (*DB, error) {
+func OpenDB(path string, tmpDir string) (*DB, error) {
 	logger := log.New() //TODO: move higher
 	if path == "" {
-		return newMemoryDB(logger)
+		return newMemoryDB(logger, tmpDir)
 	}
 	return newPersistentDB(logger, path)
 }
@@ -98,10 +99,10 @@ func bucketsConfig(_ kv.TableCfg) kv.TableCfg {
 }
 
 // newMemoryNodeDB creates a new in-memory node database without a persistent backend.
-func newMemoryDB(logger log.Logger) (*DB, error) {
+func newMemoryDB(logger log.Logger, tmpDir string) (*DB, error) {
 	db := &DB{quit: make(chan struct{})}
 	var err error
-	db.kv, err = mdbx.NewMDBX(logger).InMem().Label(kv.SentryDB).WithTablessCfg(bucketsConfig).Open()
+	db.kv, err = mdbx.NewMDBX(logger).InMem(tmpDir).Label(kv.SentryDB).WithTableCfg(bucketsConfig).Open()
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +117,7 @@ func newPersistentDB(logger log.Logger, path string) (*DB, error) {
 	db, err = mdbx.NewMDBX(logger).
 		Path(path).
 		Label(kv.SentryDB).
-		WithTablessCfg(bucketsConfig).
+		WithTableCfg(bucketsConfig).
 		MapSize(1024 * datasize.MB).
 		GrowthStep(16 * datasize.MB).
 		Flags(func(f uint) uint { return f ^ mdbx1.Durable | mdbx1.SafeNoSync }).
@@ -611,6 +612,6 @@ func (db *DB) Close() {
 	if db.quit == nil {
 		return
 	}
-	close(db.quit)
+	libcommon.SafeClose(db.quit)
 	db.kv.Close()
 }

@@ -3,36 +3,33 @@ package stagedsync
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"math/big"
 	"runtime"
 	"time"
 
 	"github.com/c2h5oh/datasize"
-	"github.com/holiman/uint256"
+	"github.com/ledgerwatch/erigon-lib/chain"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
-	"github.com/ledgerwatch/erigon-lib/common/cmp"
+	"github.com/ledgerwatch/erigon-lib/common/dbg"
+	"github.com/ledgerwatch/erigon-lib/common/hexutility"
 	"github.com/ledgerwatch/erigon-lib/etl"
-	proto_downloader "github.com/ledgerwatch/erigon-lib/gointerfaces/downloader"
 	"github.com/ledgerwatch/erigon-lib/gointerfaces/remote"
 	"github.com/ledgerwatch/erigon-lib/kv"
+	"github.com/ledgerwatch/log/v3"
+
 	"github.com/ledgerwatch/erigon/common"
-	"github.com/ledgerwatch/erigon/common/dbutils"
 	"github.com/ledgerwatch/erigon/common/math"
 	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/types"
-	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
 	"github.com/ledgerwatch/erigon/ethdb/privateapi"
-	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rlp"
 	"github.com/ledgerwatch/erigon/turbo/engineapi"
 	"github.com/ledgerwatch/erigon/turbo/services"
+	"github.com/ledgerwatch/erigon/turbo/shards"
 	"github.com/ledgerwatch/erigon/turbo/snapshotsync"
-	"github.com/ledgerwatch/erigon/turbo/snapshotsync/snapcfg"
 	"github.com/ledgerwatch/erigon/turbo/stages/bodydownload"
 	"github.com/ledgerwatch/erigon/turbo/stages/headerdownload"
-	"github.com/ledgerwatch/log/v3"
 )
 
 // The number of blocks we should be able to re-org sub-second on commodity hardware.
@@ -43,59 +40,50 @@ type HeadersCfg struct {
 	db                kv.RwDB
 	hd                *headerdownload.HeaderDownload
 	bodyDownload      *bodydownload.BodyDownload
-	chainConfig       params.ChainConfig
+	chainConfig       chain.Config
 	headerReqSend     func(context.Context, *headerdownload.HeaderRequest) ([64]byte, bool)
 	announceNewHashes func(context.Context, []headerdownload.Announce)
 	penalize          func(context.Context, []headerdownload.PenaltyItem)
 	batchSize         datasize.ByteSize
 	noP2PDiscovery    bool
-	memoryOverlay     bool
 	tmpdir            string
 
-	snapshots          *snapshotsync.RoSnapshots
-	snapshotDownloader proto_downloader.DownloaderClient
-	blockReader        services.FullBlockReader
-	dbEventNotifier    snapshotsync.DBEventNotifier
-	forkValidator      *engineapi.ForkValidator
-	notifications      *Notifications
+	snapshots     *snapshotsync.RoSnapshots
+	blockReader   services.FullBlockReader
+	forkValidator *engineapi.ForkValidator
+	notifications *shards.Notifications
 }
 
 func StageHeadersCfg(
 	db kv.RwDB,
 	headerDownload *headerdownload.HeaderDownload,
 	bodyDownload *bodydownload.BodyDownload,
-	chainConfig params.ChainConfig,
+	chainConfig chain.Config,
 	headerReqSend func(context.Context, *headerdownload.HeaderRequest) ([64]byte, bool),
 	announceNewHashes func(context.Context, []headerdownload.Announce),
 	penalize func(context.Context, []headerdownload.PenaltyItem),
 	batchSize datasize.ByteSize,
 	noP2PDiscovery bool,
-	memoryOverlay bool,
 	snapshots *snapshotsync.RoSnapshots,
-	snapshotDownloader proto_downloader.DownloaderClient,
 	blockReader services.FullBlockReader,
 	tmpdir string,
-	dbEventNotifier snapshotsync.DBEventNotifier,
-	notifications *Notifications,
+	notifications *shards.Notifications,
 	forkValidator *engineapi.ForkValidator) HeadersCfg {
 	return HeadersCfg{
-		db:                 db,
-		hd:                 headerDownload,
-		bodyDownload:       bodyDownload,
-		chainConfig:        chainConfig,
-		headerReqSend:      headerReqSend,
-		announceNewHashes:  announceNewHashes,
-		penalize:           penalize,
-		batchSize:          batchSize,
-		tmpdir:             tmpdir,
-		noP2PDiscovery:     noP2PDiscovery,
-		snapshots:          snapshots,
-		snapshotDownloader: snapshotDownloader,
-		blockReader:        blockReader,
-		dbEventNotifier:    dbEventNotifier,
-		forkValidator:      forkValidator,
-		notifications:      notifications,
-		memoryOverlay:      memoryOverlay,
+		db:                db,
+		hd:                headerDownload,
+		bodyDownload:      bodyDownload,
+		chainConfig:       chainConfig,
+		headerReqSend:     headerReqSend,
+		announceNewHashes: announceNewHashes,
+		penalize:          penalize,
+		batchSize:         batchSize,
+		tmpdir:            tmpdir,
+		noP2PDiscovery:    noP2PDiscovery,
+		snapshots:         snapshots,
+		blockReader:       blockReader,
+		forkValidator:     forkValidator,
+		notifications:     notifications,
 	}
 }
 
@@ -117,31 +105,41 @@ func SpawnStageHeaders(
 		}
 		defer tx.Rollback()
 	}
-	if err := DownloadAndIndexSnapshotsIfNeed(s, ctx, tx, cfg, initialCycle); err != nil {
-		return err
+	if initialCycle && cfg.snapshots != nil && cfg.snapshots.Cfg().Enabled {
+		if err := cfg.hd.AddHeadersFromSnapshot(tx, cfg.snapshots.BlocksAvailable(), cfg.blockReader); err != nil {
+			return err
+		}
 	}
 
-	var blockNumber uint64
+	var preProgress uint64
 	if s == nil {
-		blockNumber = 0
+		preProgress = 0
 	} else {
-		blockNumber = s.BlockNumber
+		preProgress = s.BlockNumber
 	}
+
+	notBorAndParlia := cfg.chainConfig.Bor == nil && cfg.chainConfig.Parlia == nil
 
 	unsettledForkChoice, headHeight := cfg.hd.GetUnsettledForkChoice()
-	if unsettledForkChoice != nil { // some work left to do after unwind
+	if notBorAndParlia && unsettledForkChoice != nil { // some work left to do after unwind
 		return finishHandlingForkChoice(unsettledForkChoice, headHeight, s, tx, cfg, useExternalTx)
 	}
 
-	transitionedToPoS, err := rawdb.Transitioned(tx, blockNumber, cfg.chainConfig.TerminalTotalDifficulty)
-	if err != nil {
-		return err
+	transitionedToPoS := cfg.chainConfig.TerminalTotalDifficultyPassed
+	if notBorAndParlia && !transitionedToPoS {
+		var err error
+		transitionedToPoS, err = rawdb.Transitioned(tx, preProgress, cfg.chainConfig.TerminalTotalDifficulty)
+		if err != nil {
+			return err
+		}
+		if transitionedToPoS {
+			cfg.hd.SetFirstPoSHeight(preProgress)
+		}
 	}
 
 	if transitionedToPoS {
 		libcommon.SafeClose(cfg.hd.QuitPoWMining)
-		cfg.hd.SetFirstPoSHeight(blockNumber)
-		return HeadersPOS(s, u, ctx, tx, cfg, initialCycle, test, useExternalTx)
+		return HeadersPOS(s, u, ctx, tx, cfg, initialCycle, test, useExternalTx, preProgress)
 	} else {
 		return HeadersPOW(s, u, ctx, tx, cfg, initialCycle, test, useExternalTx)
 	}
@@ -158,19 +156,26 @@ func HeadersPOS(
 	initialCycle bool,
 	test bool,
 	useExternalTx bool,
+	preProgress uint64,
 ) error {
 	if initialCycle {
-		// Let execution and other stages to finish before waiting for CL
-		return nil
+		// Let execution and other stages to finish before waiting for CL, but only if other stages aren't ahead.
+		// Specifically, this allows to execute snapshot blocks before waiting for CL.
+		if execProgress, err := s.ExecutionAt(tx); err != nil {
+			return err
+		} else if s.BlockNumber >= execProgress {
+			return nil
+		}
 	}
 
-	log.Info(fmt.Sprintf("[%s] Waiting for Beacon Chain...", s.LogPrefix()))
-
-	onlyNewRequests := cfg.hd.PosStatus() == headerdownload.Syncing
-	interrupt, requestId, requestWithStatus := cfg.hd.BeaconRequestList.WaitForRequest(onlyNewRequests, test)
-
 	cfg.hd.SetPOSSync(true)
-	cfg.hd.SetHeaderReader(&chainReader{config: &cfg.chainConfig, tx: tx, blockReader: cfg.blockReader})
+	syncing := cfg.hd.PosStatus() != headerdownload.Idle
+	if !syncing {
+		log.Info(fmt.Sprintf("[%s] Waiting for Consensus Layer...", s.LogPrefix()))
+	}
+	interrupt, requestId, requestWithStatus := cfg.hd.BeaconRequestList.WaitForRequest(syncing, test)
+
+	cfg.hd.SetHeaderReader(&ChainReaderImpl{config: &cfg.chainConfig, tx: tx, blockReader: cfg.blockReader})
 	headerInserter := headerdownload.NewHeaderInserter(s.LogPrefix(), nil, s.BlockNumber, cfg.blockReader)
 
 	interrupted, err := handleInterrupt(interrupt, cfg, tx, headerInserter, useExternalTx)
@@ -197,7 +202,7 @@ func HeadersPOS(
 
 	var payloadStatus *engineapi.PayloadStatus
 	if forkChoiceInsteadOfNewPayload {
-		payloadStatus, err = startHandlingForkChoice(forkChoiceMessage, requestStatus, requestId, s, u, ctx, tx, cfg, test, headerInserter)
+		payloadStatus, err = startHandlingForkChoice(forkChoiceMessage, requestStatus, requestId, s, u, ctx, tx, cfg, test, headerInserter, preProgress)
 	} else {
 		payloadMessage := request.(*types.Block)
 		payloadStatus, err = handleNewPayload(payloadMessage, requestStatus, requestId, s, ctx, tx, cfg, test, headerInserter)
@@ -234,7 +239,7 @@ func writeForkChoiceHashes(
 	tx kv.RwTx,
 	cfg HeadersCfg,
 ) (bool, error) {
-	if forkChoice.SafeBlockHash != (common.Hash{}) {
+	if forkChoice.SafeBlockHash != (libcommon.Hash{}) {
 		safeIsCanonical, err := rawdb.IsCanonicalHash(tx, forkChoice.SafeBlockHash)
 		if err != nil {
 			return false, err
@@ -245,7 +250,7 @@ func writeForkChoiceHashes(
 		}
 	}
 
-	if forkChoice.FinalizedBlockHash != (common.Hash{}) {
+	if forkChoice.FinalizedBlockHash != (libcommon.Hash{}) {
 		finalizedIsCanonical, err := rawdb.IsCanonicalHash(tx, forkChoice.FinalizedBlockHash)
 		if err != nil {
 			return false, err
@@ -257,10 +262,10 @@ func writeForkChoiceHashes(
 	}
 
 	rawdb.WriteForkchoiceHead(tx, forkChoice.HeadBlockHash)
-	if forkChoice.SafeBlockHash != (common.Hash{}) {
+	if forkChoice.SafeBlockHash != (libcommon.Hash{}) {
 		rawdb.WriteForkchoiceSafe(tx, forkChoice.SafeBlockHash)
 	}
-	if forkChoice.FinalizedBlockHash != (common.Hash{}) {
+	if forkChoice.FinalizedBlockHash != (libcommon.Hash{}) {
 		rawdb.WriteForkchoiceFinalized(tx, forkChoice.FinalizedBlockHash)
 	}
 
@@ -278,31 +283,47 @@ func startHandlingForkChoice(
 	cfg HeadersCfg,
 	test bool,
 	headerInserter *headerdownload.HeaderInserter,
+	preProgress uint64,
 ) (*engineapi.PayloadStatus, error) {
-	if cfg.memoryOverlay {
-		defer cfg.forkValidator.ClearWithUnwind(tx, cfg.notifications.Accumulator, cfg.notifications.StateChangesConsumer)
-	}
+	defer cfg.forkValidator.ClearWithUnwind(tx, cfg.notifications.Accumulator, cfg.notifications.StateChangesConsumer)
 	headerHash := forkChoice.HeadBlockHash
 	log.Debug(fmt.Sprintf("[%s] Handling fork choice", s.LogPrefix()), "headerHash", headerHash)
 
-	currentHeadHash := rawdb.ReadHeadHeaderHash(tx)
-	if currentHeadHash == headerHash { // no-op
-		log.Debug(fmt.Sprintf("[%s] Fork choice no-op", s.LogPrefix()))
+	canonical, err := rawdb.IsCanonicalHash(tx, headerHash)
+	if err != nil {
+		log.Warn(fmt.Sprintf("[%s] Fork choice err (IsCanonicalHash)", s.LogPrefix()), "err", err)
 		cfg.hd.BeaconRequestList.Remove(requestId)
-		canonical, err := writeForkChoiceHashes(forkChoice, s, tx, cfg)
+		return nil, err
+	}
+	if canonical {
+		headerNumber := rawdb.ReadHeaderNumber(tx, headerHash)
+		ihProgress, err := s.IntermediateHashesAt(tx)
 		if err != nil {
-			log.Warn(fmt.Sprintf("[%s] Fork choice err", s.LogPrefix()), "err", err)
+			log.Warn(fmt.Sprintf("[%s] Fork choice err (IntermediateHashesAt)", s.LogPrefix()), "err", err)
+			cfg.hd.BeaconRequestList.Remove(requestId)
 			return nil, err
 		}
-		if canonical {
-			return &engineapi.PayloadStatus{
-				Status:          remote.EngineStatus_VALID,
-				LatestValidHash: currentHeadHash,
-			}, nil
-		} else {
-			return &engineapi.PayloadStatus{
-				CriticalError: &privateapi.InvalidForkchoiceStateErr,
-			}, nil
+		if ihProgress >= *headerNumber {
+			// FCU points to a canonical and fully validated block in the past.
+			// Treat it as a no-op to avoid unnecessary unwind of block execution and other stages
+			// with subsequent rewind on a newer FCU.
+			log.Debug(fmt.Sprintf("[%s] Fork choice no-op", s.LogPrefix()))
+			cfg.hd.BeaconRequestList.Remove(requestId)
+			canonical, err = writeForkChoiceHashes(forkChoice, s, tx, cfg)
+			if err != nil {
+				log.Warn(fmt.Sprintf("[%s] Fork choice err", s.LogPrefix()), "err", err)
+				return nil, err
+			}
+			if canonical {
+				return &engineapi.PayloadStatus{
+					Status:          remote.EngineStatus_VALID,
+					LatestValidHash: headerHash,
+				}, nil
+			} else {
+				return &engineapi.PayloadStatus{
+					CriticalError: &privateapi.InvalidForkchoiceStateErr,
+				}, nil
+			}
 		}
 	}
 
@@ -315,7 +336,7 @@ func startHandlingForkChoice(
 	}
 
 	if header == nil {
-		log.Info(fmt.Sprintf("[%s] Fork choice missing header with hash %x", s.LogPrefix(), headerHash))
+		log.Debug(fmt.Sprintf("[%s] Fork choice: need to download header with hash %x", s.LogPrefix(), headerHash))
 		if test {
 			cfg.hd.BeaconRequestList.Remove(requestId)
 		} else {
@@ -328,12 +349,11 @@ func startHandlingForkChoice(
 
 	headerNumber := header.Number.Uint64()
 
-	if cfg.memoryOverlay && headerHash == cfg.forkValidator.ExtendingForkHeadHash() {
-		log.Info("Flushing in-memory state")
-		if err := cfg.forkValidator.FlushExtendingFork(tx); err != nil {
+	if headerHash == cfg.forkValidator.ExtendingForkHeadHash() {
+		log.Info(fmt.Sprintf("[%s] Fork choice update: flushing in-memory state (built by previous newPayload)", s.LogPrefix()))
+		if err := cfg.forkValidator.FlushExtendingFork(tx, cfg.notifications.Accumulator); err != nil {
 			return nil, err
 		}
-		cfg.hd.BeaconRequestList.Remove(requestId)
 		canonical, err := writeForkChoiceHashes(forkChoice, s, tx, cfg)
 		if err != nil {
 			log.Warn(fmt.Sprintf("[%s] Fork choice err", s.LogPrefix()), "err", err)
@@ -349,26 +369,58 @@ func startHandlingForkChoice(
 		}
 	}
 
-	cfg.hd.UpdateTopSeenHeightPoS(headerNumber)
 	forkingPoint, err := forkingPoint(ctx, tx, headerInserter, cfg.blockReader, header)
 	if err != nil {
 		return nil, err
 	}
+	if forkingPoint < preProgress {
 
-	log.Info(fmt.Sprintf("[%s] Fork choice re-org", s.LogPrefix()), "headerNumber", headerNumber, "forkingPoint", forkingPoint)
+		log.Info(fmt.Sprintf("[%s] Fork choice: re-org", s.LogPrefix()), "goal", headerNumber, "from", preProgress, "unwind to", forkingPoint)
 
-	if requestStatus == engineapi.New {
-		if headerNumber-forkingPoint <= ShortPoSReorgThresholdBlocks {
-			// TODO(yperbasis): what if some bodies are missing and we have to download them?
-			cfg.hd.SetPendingPayloadHash(headerHash)
+		if requestStatus == engineapi.New {
+			if headerNumber-forkingPoint <= ShortPoSReorgThresholdBlocks {
+				// TODO(yperbasis): what if some bodies are missing and we have to download them?
+				cfg.hd.SetPendingPayloadHash(headerHash)
+			} else {
+				cfg.hd.PayloadStatusCh <- engineapi.PayloadStatus{Status: remote.EngineStatus_SYNCING}
+			}
+		}
+
+		u.UnwindTo(forkingPoint, libcommon.Hash{})
+
+		cfg.hd.SetUnsettledForkChoice(forkChoice, headerNumber)
+	} else {
+		// Extend canonical chain by the new header
+		log.Info(fmt.Sprintf("[%s] Fork choice: chain extension", s.LogPrefix()), "from", preProgress, "to", headerNumber)
+		logEvery := time.NewTicker(logInterval)
+		defer logEvery.Stop()
+		if err = fixCanonicalChain(s.LogPrefix(), logEvery, headerNumber, headerHash, tx, cfg.blockReader); err != nil {
+			return nil, err
+		}
+		if err = rawdb.WriteHeadHeaderHash(tx, headerHash); err != nil {
+			return nil, err
+		}
+
+		canonical, err := writeForkChoiceHashes(forkChoice, s, tx, cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := s.Update(tx, headerNumber); err != nil {
+			return nil, err
+		}
+
+		if canonical {
+			return &engineapi.PayloadStatus{
+				Status:          remote.EngineStatus_VALID,
+				LatestValidHash: headerHash,
+			}, nil
 		} else {
-			cfg.hd.PayloadStatusCh <- engineapi.PayloadStatus{Status: remote.EngineStatus_SYNCING}
+			return &engineapi.PayloadStatus{
+				CriticalError: &privateapi.InvalidForkchoiceStateErr,
+			}, nil
 		}
 	}
-
-	u.UnwindTo(forkingPoint, common.Hash{})
-
-	cfg.hd.SetUnsettledForkChoice(forkChoice, headerNumber)
 
 	return nil, nil
 }
@@ -410,7 +462,7 @@ func finishHandlingForkChoice(
 	}
 
 	if !canonical {
-		if cfg.hd.GetPendingPayloadHash() != (common.Hash{}) {
+		if cfg.hd.GetPendingPayloadHash() != (libcommon.Hash{}) {
 			cfg.hd.PayloadStatusCh <- engineapi.PayloadStatus{
 				CriticalError: &privateapi.InvalidForkchoiceStateErr,
 			}
@@ -437,15 +489,14 @@ func handleNewPayload(
 	headerNumber := header.Number.Uint64()
 	headerHash := block.Hash()
 
-	log.Debug(fmt.Sprintf("[%s] Handling new payload", s.LogPrefix()), "height", headerNumber, "hash", headerHash)
-	cfg.hd.UpdateTopSeenHeightPoS(headerNumber)
+	log.Info(fmt.Sprintf("[%s] Handling new payload", s.LogPrefix()), "height", headerNumber, "hash", headerHash)
 
 	parent, err := cfg.blockReader.HeaderByHash(ctx, tx, header.ParentHash)
 	if err != nil {
 		return nil, err
 	}
 	if parent == nil {
-		log.Info(fmt.Sprintf("[%s] New payload missing parent", s.LogPrefix()))
+		log.Debug(fmt.Sprintf("[%s] New payload: need to download parent", s.LogPrefix()), "height", headerNumber, "hash", headerHash, "parentHash", header.ParentHash)
 		if test {
 			cfg.hd.BeaconRequestList.Remove(requestId)
 			return &engineapi.PayloadStatus{Status: remote.EngineStatus_SYNCING}, nil
@@ -467,7 +518,7 @@ func handleNewPayload(
 			}
 			if success {
 				// If we downloaded the headers in time, then save them and proceed with the new header
-				verifyAndSaveDownloadedPoSHeaders(tx, cfg, headerInserter)
+				saveDownloadedPoSHeaders(tx, cfg, headerInserter, true /* validate */)
 			} else {
 				return &engineapi.PayloadStatus{Status: remote.EngineStatus_SYNCING}, nil
 			}
@@ -486,7 +537,7 @@ func handleNewPayload(
 	}
 
 	if cfg.bodyDownload != nil {
-		cfg.bodyDownload.AddToPrefetch(block)
+		cfg.bodyDownload.AddToPrefetch(header, block.RawBody())
 	}
 
 	return response, nil
@@ -522,87 +573,46 @@ func verifyAndSaveNewPoSHeader(
 
 	currentHeadHash := rawdb.ReadHeadHeaderHash(tx)
 
-	forkingPoint, err := forkingPoint(ctx, tx, headerInserter, cfg.blockReader, header)
-	if err != nil {
+	extendingHash := cfg.forkValidator.ExtendingForkHeadHash()
+	extendCanonical := (extendingHash == libcommon.Hash{} && header.ParentHash == currentHeadHash) || extendingHash == header.ParentHash
+	status, latestValidHash, validationError, criticalError := cfg.forkValidator.ValidatePayload(tx, header, block.RawBody(), extendCanonical)
+	if criticalError != nil {
+		return nil, false, criticalError
+	}
+	success = validationError == nil
+	if !success {
+		log.Warn("Validation failed for header", "hash", headerHash, "height", headerNumber, "err", validationError)
+		cfg.hd.ReportBadHeaderPoS(headerHash, latestValidHash)
+	} else if err := headerInserter.FeedHeaderPoS(tx, header, headerHash); err != nil {
 		return nil, false, err
 	}
-	forkingHash, err := cfg.blockReader.CanonicalHash(ctx, tx, forkingPoint)
-
-	canExtendCanonical := forkingHash == currentHeadHash
-
-	if cfg.memoryOverlay {
-		extendingHash := cfg.forkValidator.ExtendingForkHeadHash()
-		extendCanonical := (extendingHash == common.Hash{} && header.ParentHash == currentHeadHash) || extendingHash == header.ParentHash
-		status, latestValidHash, validationError, criticalError := cfg.forkValidator.ValidatePayload(tx, header, block.RawBody(), extendCanonical)
-		if criticalError != nil {
-			return nil, false, criticalError
-		}
-		success = validationError == nil
-		if !success {
-			log.Warn("Validation failed for header", "hash", headerHash, "height", headerNumber, "err", validationError)
-			cfg.hd.ReportBadHeaderPoS(headerHash, latestValidHash)
-		} else if err := headerInserter.FeedHeaderPoS(tx, header, headerHash); err != nil {
-			return nil, false, err
-		}
-		return &engineapi.PayloadStatus{
-			Status:          status,
-			LatestValidHash: latestValidHash,
-			ValidationError: validationError,
-		}, success, nil
-	}
-
-	if err := headerInserter.FeedHeaderPoS(tx, header, headerHash); err != nil {
-		return nil, false, err
-	}
-
-	if !canExtendCanonical {
-		log.Info("Side chain", "parentHash", header.ParentHash, "currentHead", currentHeadHash)
-		return &engineapi.PayloadStatus{Status: remote.EngineStatus_ACCEPTED}, true, nil
-	}
-
-	// OK, we're on the canonical chain
-	if requestStatus == engineapi.New {
-		cfg.hd.SetPendingPayloadHash(headerHash)
-	}
-
-	logEvery := time.NewTicker(logInterval)
-	defer logEvery.Stop()
-
-	// Extend canonical chain by the new header
-	err = fixCanonicalChain(s.LogPrefix(), logEvery, headerInserter.GetHighest(), headerInserter.GetHighestHash(), tx, cfg.blockReader)
-	if err != nil {
-		return nil, false, err
-	}
-
-	err = rawdb.WriteHeadHeaderHash(tx, headerHash)
-	if err != nil {
-		return nil, false, err
-	}
-
-	err = s.Update(tx, headerNumber)
-	if err != nil {
-		return nil, false, err
-	}
-
-	return nil, true, nil
+	return &engineapi.PayloadStatus{
+		Status:          status,
+		LatestValidHash: latestValidHash,
+		ValidationError: validationError,
+	}, success, nil
 }
 
 func schedulePoSDownload(
 	requestId int,
-	hashToDownload common.Hash,
+	hashToDownload libcommon.Hash,
 	heightToDownload uint64,
-	downloaderTip common.Hash,
+	downloaderTip libcommon.Hash,
 	s *StageState,
 	cfg HeadersCfg,
 ) bool {
 	cfg.hd.BeaconRequestList.SetStatus(requestId, engineapi.DataWasMissing)
 
 	if cfg.hd.PosStatus() != headerdownload.Idle {
-		log.Debug(fmt.Sprintf("[%s] Postponing PoS download since another one is in progress", s.LogPrefix()), "height", heightToDownload, "hash", hashToDownload)
+		log.Info(fmt.Sprintf("[%s] Postponing PoS download since another one is in progress", s.LogPrefix()), "height", heightToDownload, "hash", hashToDownload)
 		return false
 	}
 
-	log.Info(fmt.Sprintf("[%s] Downloading PoS headers...", s.LogPrefix()), "height", heightToDownload, "hash", hashToDownload, "requestId", requestId)
+	if heightToDownload == 0 {
+		log.Info(fmt.Sprintf("[%s] Downloading PoS headers...", s.LogPrefix()), "height", "unknown", "hash", hashToDownload, "requestId", requestId)
+	} else {
+		log.Info(fmt.Sprintf("[%s] Downloading PoS headers...", s.LogPrefix()), "height", heightToDownload, "hash", hashToDownload, "requestId", requestId)
+	}
 
 	cfg.hd.SetRequestId(requestId)
 	cfg.hd.SetPoSDownloaderTip(downloaderTip)
@@ -611,7 +621,7 @@ func schedulePoSDownload(
 
 	//nolint
 	headerCollector := etl.NewCollector(s.LogPrefix(), cfg.tmpdir, etl.NewSortableBuffer(etl.BufferOptimalSize))
-	// headerCollector is closed in verifyAndSaveDownloadedPoSHeaders, thus nolint
+	// headerCollector is closed in saveDownloadedPoSHeaders, thus nolint
 
 	cfg.hd.SetHeadersCollector(headerCollector)
 
@@ -620,13 +630,17 @@ func schedulePoSDownload(
 	return true
 }
 
-func verifyAndSaveDownloadedPoSHeaders(tx kv.RwTx, cfg HeadersCfg, headerInserter *headerdownload.HeaderInserter) {
-	var lastValidHash common.Hash
+func saveDownloadedPoSHeaders(tx kv.RwTx, cfg HeadersCfg, headerInserter *headerdownload.HeaderInserter, validate bool) {
+	var lastValidHash libcommon.Hash
 	var badChainError error
 	var foundPow bool
 
 	headerLoadFunc := func(key, value []byte, _ etl.CurrentTableReader, _ etl.LoadNextFunc) error {
 		var h types.Header
+		// no header to process
+		if value == nil {
+			return nil
+		}
 		if err := rlp.DecodeBytes(value, &h); err != nil {
 			return err
 		}
@@ -646,19 +660,21 @@ func verifyAndSaveDownloadedPoSHeaders(tx kv.RwTx, cfg HeadersCfg, headerInserte
 			return headerInserter.FeedHeaderPoS(tx, &h, h.Hash())
 		}
 
-		foundPow = h.Difficulty.Cmp(common.Big0) != 0
+		foundPow = h.Difficulty.Cmp(libcommon.Big0) != 0
 		if foundPow {
 			return headerInserter.FeedHeaderPoS(tx, &h, h.Hash())
 		}
 		// Validate state if possible (bodies will be retrieved through body download)
-		_, _, validationError, criticalError := cfg.forkValidator.ValidatePayload(tx, &h, nil, false)
-		if criticalError != nil {
-			return criticalError
-		}
-		if validationError != nil {
-			badChainError = validationError
-			cfg.hd.ReportBadHeaderPoS(h.Hash(), lastValidHash)
-			return nil
+		if validate {
+			_, _, validationError, criticalError := cfg.forkValidator.ValidatePayload(tx, &h, nil, false)
+			if criticalError != nil {
+				return criticalError
+			}
+			if validationError != nil {
+				badChainError = validationError
+				cfg.hd.ReportBadHeaderPoS(h.Hash(), lastValidHash)
+				return nil
+			}
 		}
 
 		return headerInserter.FeedHeaderPoS(tx, &h, h.Hash())
@@ -707,10 +723,11 @@ func forkingPoint(
 func handleInterrupt(interrupt engineapi.Interrupt, cfg HeadersCfg, tx kv.RwTx, headerInserter *headerdownload.HeaderInserter, useExternalTx bool) (bool, error) {
 	if interrupt != engineapi.None {
 		if interrupt == engineapi.Stopping {
-			cfg.hd.PayloadStatusCh <- engineapi.PayloadStatus{CriticalError: errors.New("server is stopping")}
+			close(cfg.hd.ShutdownCh)
+			return false, fmt.Errorf("server is stopping")
 		}
 		if interrupt == engineapi.Synced && cfg.hd.HeadersCollector() != nil {
-			verifyAndSaveDownloadedPoSHeaders(tx, cfg, headerInserter)
+			saveDownloadedPoSHeaders(tx, cfg, headerInserter, false /* validate */)
 		}
 		if !useExternalTx {
 			return true, tx.Commit()
@@ -749,7 +766,7 @@ func HeadersPOW(
 	}
 	logEvery := time.NewTicker(logInterval)
 	defer logEvery.Stop()
-	if hash == (common.Hash{}) {
+	if hash == (libcommon.Hash{}) {
 		headHash := rawdb.ReadHeadHeaderHash(tx)
 		if err = fixCanonicalChain(logPrefix, logEvery, headerProgress, headHash, tx, cfg.blockReader); err != nil {
 			return err
@@ -777,14 +794,15 @@ func HeadersPOW(
 		return fmt.Errorf("localTD is nil: %d, %x", headerProgress, hash)
 	}
 	headerInserter := headerdownload.NewHeaderInserter(logPrefix, localTd, headerProgress, cfg.blockReader)
-	cfg.hd.SetHeaderReader(&chainReader{config: &cfg.chainConfig, tx: tx, blockReader: cfg.blockReader})
+	cfg.hd.SetHeaderReader(&ChainReaderImpl{config: &cfg.chainConfig, tx: tx, blockReader: cfg.blockReader})
 
-	var sentToPeer bool
 	stopped := false
+	var noProgressCounter uint = 0
 	prevProgress := headerProgress
-	var noProgressCounter int
 	var wasProgress bool
 	var lastSkeletonTime time.Time
+	var peer [64]byte
+	var sentToPeer bool
 Loop:
 	for !stopped {
 
@@ -799,15 +817,15 @@ Loop:
 			break
 		}
 
+		sentToPeer = false
 		currentTime := time.Now()
 		req, penalties := cfg.hd.RequestMoreHeaders(currentTime)
 		if req != nil {
-			_, sentToPeer = cfg.headerReqSend(ctx, req)
+			peer, sentToPeer = cfg.headerReqSend(ctx, req)
 			if sentToPeer {
-				cfg.hd.UpdateStats(req, false /* skeleton */)
+				cfg.hd.UpdateStats(req, false /* skeleton */, peer)
+				cfg.hd.UpdateRetryTime(req, currentTime, 5*time.Second /* timeout */)
 			}
-			// Regardless of whether request was actually sent to a peer, we update retry time to be 5 seconds in the future
-			cfg.hd.UpdateRetryTime(req, currentTime, 5*time.Second /* timeout */)
 		}
 		if len(penalties) > 0 {
 			cfg.penalize(ctx, penalties)
@@ -816,12 +834,11 @@ Loop:
 		for req != nil && sentToPeer && maxRequests > 0 {
 			req, penalties = cfg.hd.RequestMoreHeaders(currentTime)
 			if req != nil {
-				_, sentToPeer = cfg.headerReqSend(ctx, req)
+				peer, sentToPeer = cfg.headerReqSend(ctx, req)
 				if sentToPeer {
-					cfg.hd.UpdateStats(req, false /* skeleton */)
+					cfg.hd.UpdateStats(req, false /* skeleton */, peer)
+					cfg.hd.UpdateRetryTime(req, currentTime, 5*time.Second /* timeout */)
 				}
-				// Regardless of whether request was actually sent to a peer, we update retry time to be 5 seconds in the future
-				cfg.hd.UpdateRetryTime(req, currentTime, 5*time.Second /* timeout */)
 			}
 			if len(penalties) > 0 {
 				cfg.penalize(ctx, penalties)
@@ -833,16 +850,16 @@ Loop:
 		if time.Since(lastSkeletonTime) > 1*time.Second {
 			req = cfg.hd.RequestSkeleton()
 			if req != nil {
-				_, sentToPeer = cfg.headerReqSend(ctx, req)
+				peer, sentToPeer = cfg.headerReqSend(ctx, req)
 				if sentToPeer {
-					cfg.hd.UpdateStats(req, true /* skeleton */)
+					cfg.hd.UpdateStats(req, true /* skeleton */, peer)
 					lastSkeletonTime = time.Now()
 				}
 			}
 		}
 		// Load headers into the database
 		var inSync bool
-		if inSync, err = cfg.hd.InsertHeaders(headerInserter.NewFeedHeaderFunc(tx, cfg.blockReader), cfg.chainConfig.TerminalTotalDifficulty, logPrefix, logEvery.C); err != nil {
+		if inSync, err = cfg.hd.InsertHeaders(headerInserter.NewFeedHeaderFunc(tx, cfg.blockReader), cfg.chainConfig.TerminalTotalDifficulty, logPrefix, logEvery.C, uint64(currentTime.Unix())); err != nil {
 			return err
 		}
 
@@ -856,10 +873,6 @@ Loop:
 		if headerInserter.BestHeaderChanged() { // We do not break unless there best header changed
 			noProgressCounter = 0
 			wasProgress = true
-			if !initialCycle {
-				// if this is not an initial cycle, we need to react quickly when new headers are coming in
-				break
-			}
 			// if this is initial cycle, we want to make sure we insert all known headers (inSync)
 			if inSync {
 				break
@@ -878,15 +891,17 @@ Loop:
 			stats := cfg.hd.ExtractStats()
 			if prevProgress == progress {
 				noProgressCounter++
-				if noProgressCounter >= 5 {
-					log.Info("Req/resp stats", "req", stats.Requests, "reqMin", stats.ReqMinBlock, "reqMax", stats.ReqMaxBlock,
-						"skel", stats.SkeletonRequests, "skelMin", stats.SkeletonReqMinBlock, "skelMax", stats.SkeletonReqMaxBlock,
-						"resp", stats.Responses, "respMin", stats.RespMinBlock, "respMax", stats.RespMaxBlock, "dups", stats.Duplicates)
-					cfg.hd.LogAnchorState()
-					if wasProgress {
-						log.Warn("Looks like chain is not progressing, moving to the next stage")
-						break Loop
-					}
+			} else {
+				noProgressCounter = 0 // Reset, there was progress
+			}
+			if noProgressCounter >= 5 {
+				log.Info("Req/resp stats", "req", stats.Requests, "reqMin", stats.ReqMinBlock, "reqMax", stats.ReqMaxBlock,
+					"skel", stats.SkeletonRequests, "skelMin", stats.SkeletonReqMinBlock, "skelMax", stats.SkeletonReqMaxBlock,
+					"resp", stats.Responses, "respMin", stats.RespMinBlock, "respMax", stats.RespMaxBlock, "dups", stats.Duplicates)
+				cfg.hd.LogAnchorState()
+				if wasProgress {
+					log.Warn("Looks like chain is not progressing, moving to the next stage")
+					break Loop
 				}
 			}
 			prevProgress = progress
@@ -898,7 +913,7 @@ Loop:
 		timer.Stop()
 	}
 	if headerInserter.Unwind() {
-		u.UnwindTo(headerInserter.UnwindPoint(), common.Hash{})
+		u.UnwindTo(headerInserter.UnwindPoint(), libcommon.Hash{})
 	}
 	if headerInserter.GetHighest() != 0 {
 		if !headerInserter.Unwind() {
@@ -927,14 +942,14 @@ Loop:
 	return nil
 }
 
-func fixCanonicalChain(logPrefix string, logEvery *time.Ticker, height uint64, hash common.Hash, tx kv.StatelessRwTx, headerReader services.FullBlockReader) error {
+func fixCanonicalChain(logPrefix string, logEvery *time.Ticker, height uint64, hash libcommon.Hash, tx kv.StatelessRwTx, headerReader services.FullBlockReader) error {
 	if height == 0 {
 		return nil
 	}
 	ancestorHash := hash
 	ancestorHeight := height
 
-	var ch common.Hash
+	var ch libcommon.Hash
 	var err error
 	for ch, err = headerReader.CanonicalHash(context.Background(), tx, ancestorHeight); err == nil && ch != ancestorHash; ch, err = headerReader.CanonicalHash(context.Background(), tx, ancestorHeight) {
 		if err = rawdb.WriteCanonicalHash(tx, ancestorHash, ancestorHeight); err != nil {
@@ -974,7 +989,7 @@ func HeadersUnwind(u *UnwindState, s *StageState, tx kv.RwTx, cfg HeadersCfg, te
 		defer tx.Rollback()
 	}
 	// Delete canonical hashes that are being unwound
-	badBlock := u.BadBlock != (common.Hash{})
+	badBlock := u.BadBlock != (libcommon.Hash{})
 	if badBlock {
 		cfg.hd.ReportBadHeader(u.BadBlock)
 		// Mark all descendants of bad block as bad too
@@ -984,7 +999,7 @@ func HeadersUnwind(u *UnwindState, s *StageState, tx kv.RwTx, cfg HeadersCfg, te
 		}
 		defer headerCursor.Close()
 		var k, v []byte
-		for k, v, err = headerCursor.Seek(dbutils.EncodeBlockNumber(u.UnwindPoint + 1)); err == nil && k != nil; k, v, err = headerCursor.Next() {
+		for k, v, err = headerCursor.Seek(hexutility.EncodeTs(u.UnwindPoint + 1)); err == nil && k != nil; k, v, err = headerCursor.Next() {
 			var h types.Header
 			if err = rlp.DecodeBytes(v, &h); err != nil {
 				return err
@@ -1002,7 +1017,7 @@ func HeadersUnwind(u *UnwindState, s *StageState, tx kv.RwTx, cfg HeadersCfg, te
 	}
 	if badBlock {
 		var maxTd big.Int
-		var maxHash common.Hash
+		var maxHash libcommon.Hash
 		var maxNum uint64 = 0
 
 		if test { // If we are not in the test, we can do searching for the heaviest chain in the next cycle
@@ -1021,7 +1036,7 @@ func HeadersUnwind(u *UnwindState, s *StageState, tx kv.RwTx, cfg HeadersCfg, te
 				if len(k) != 40 {
 					return fmt.Errorf("key in TD table has to be 40 bytes long: %x", k)
 				}
-				var hash common.Hash
+				var hash libcommon.Hash
 				copy(hash[:], k[8:])
 				if cfg.hd.IsBadHeader(hash) {
 					continue
@@ -1072,12 +1087,12 @@ func HeadersUnwind(u *UnwindState, s *StageState, tx kv.RwTx, cfg HeadersCfg, te
 func logProgressHeaders(logPrefix string, prev, now uint64) uint64 {
 	speed := float64(now-prev) / float64(logInterval/time.Second)
 	if speed == 0 {
-		// Don't log "Wrote block ..." unless we're actually writing something
+		log.Info(fmt.Sprintf("[%s] No block headers to write in this log period", logPrefix), "block number", now)
 		return now
 	}
 
 	var m runtime.MemStats
-	libcommon.ReadMemStats(&m)
+	dbg.ReadMemStats(&m)
 	log.Info(fmt.Sprintf("[%s] Wrote block headers", logPrefix),
 		"number", now,
 		"blk/second", speed,
@@ -1087,22 +1102,26 @@ func logProgressHeaders(logPrefix string, prev, now uint64) uint64 {
 	return now
 }
 
-type chainReader struct {
-	config      *params.ChainConfig
-	tx          kv.RwTx
+type ChainReaderImpl struct {
+	config      *chain.Config
+	tx          kv.Getter
 	blockReader services.FullBlockReader
 }
 
-func (cr chainReader) Config() *params.ChainConfig  { return cr.config }
-func (cr chainReader) CurrentHeader() *types.Header { panic("") }
-func (cr chainReader) GetHeader(hash common.Hash, number uint64) *types.Header {
+func NewChainReaderImpl(config *chain.Config, tx kv.Getter, blockReader services.FullBlockReader) *ChainReaderImpl {
+	return &ChainReaderImpl{config, tx, blockReader}
+}
+
+func (cr ChainReaderImpl) Config() *chain.Config        { return cr.config }
+func (cr ChainReaderImpl) CurrentHeader() *types.Header { panic("") }
+func (cr ChainReaderImpl) GetHeader(hash libcommon.Hash, number uint64) *types.Header {
 	if cr.blockReader != nil {
 		h, _ := cr.blockReader.Header(context.Background(), cr.tx, hash, number)
 		return h
 	}
 	return rawdb.ReadHeader(cr.tx, hash, number)
 }
-func (cr chainReader) GetHeaderByNumber(number uint64) *types.Header {
+func (cr ChainReaderImpl) GetHeaderByNumber(number uint64) *types.Header {
 	if cr.blockReader != nil {
 		h, _ := cr.blockReader.HeaderByNumber(context.Background(), cr.tx, number)
 		return h
@@ -1110,7 +1129,7 @@ func (cr chainReader) GetHeaderByNumber(number uint64) *types.Header {
 	return rawdb.ReadHeaderByNumber(cr.tx, number)
 
 }
-func (cr chainReader) GetHeaderByHash(hash common.Hash) *types.Header {
+func (cr ChainReaderImpl) GetHeaderByHash(hash libcommon.Hash) *types.Header {
 	if cr.blockReader != nil {
 		number := rawdb.ReadHeaderNumber(cr.tx, hash)
 		if number == nil {
@@ -1121,33 +1140,13 @@ func (cr chainReader) GetHeaderByHash(hash common.Hash) *types.Header {
 	h, _ := rawdb.ReadHeaderByHash(cr.tx, hash)
 	return h
 }
-func (cr chainReader) GetTd(hash common.Hash, number uint64) *big.Int {
+func (cr ChainReaderImpl) GetTd(hash libcommon.Hash, number uint64) *big.Int {
 	td, err := rawdb.ReadTd(cr.tx, hash, number)
 	if err != nil {
 		log.Error("ReadTd failed", "err", err)
 		return nil
 	}
 	return td
-}
-
-type epochReader struct {
-	tx kv.RwTx
-}
-
-func (cr epochReader) GetEpoch(hash common.Hash, number uint64) ([]byte, error) {
-	return rawdb.ReadEpoch(cr.tx, number, hash)
-}
-func (cr epochReader) PutEpoch(hash common.Hash, number uint64, proof []byte) error {
-	return rawdb.WriteEpoch(cr.tx, number, hash, proof)
-}
-func (cr epochReader) GetPendingEpoch(hash common.Hash, number uint64) ([]byte, error) {
-	return rawdb.ReadPendingEpoch(cr.tx, number, hash)
-}
-func (cr epochReader) PutPendingEpoch(hash common.Hash, number uint64, proof []byte) error {
-	return rawdb.WritePendingEpoch(cr.tx, number, hash, proof)
-}
-func (cr epochReader) FindBeforeOrEqualNumber(number uint64) (blockNum uint64, blockHash common.Hash, transitionProof []byte, err error) {
-	return rawdb.FindEpochBeforeOrEqualNumber(cr.tx, number)
 }
 
 func HeadersPrune(p *PruneState, tx kv.RwTx, cfg HeadersCfg, ctx context.Context) (err error) {
@@ -1162,236 +1161,6 @@ func HeadersPrune(p *PruneState, tx kv.RwTx, cfg HeadersCfg, ctx context.Context
 
 	if !useExternalTx {
 		if err = tx.Commit(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.RwTx, cfg HeadersCfg, initialCycle bool) error {
-	if !initialCycle || cfg.snapshots == nil || !cfg.snapshots.Cfg().Enabled {
-		return nil
-	}
-
-	if err := WaitForDownloader(ctx, cfg, tx); err != nil {
-		return err
-	}
-	if err := cfg.snapshots.ReopenFolder(); err != nil {
-		return fmt.Errorf("ReopenSegments: %w", err)
-	}
-	if cfg.dbEventNotifier != nil {
-		cfg.dbEventNotifier.OnNewSnapshot()
-	}
-
-	cfg.snapshots.LogStat()
-
-	// Create .idx files
-	if cfg.snapshots.IndicesMax() < cfg.snapshots.SegmentsMax() {
-		if !cfg.snapshots.Cfg().Produce && cfg.snapshots.IndicesMax() == 0 {
-			return fmt.Errorf("please remove --snap.stop, erigon can't work without creating basic indices")
-		}
-		if cfg.snapshots.Cfg().Produce {
-			if !cfg.snapshots.SegmentsReady() {
-				return fmt.Errorf("not all snapshot segments are available")
-			}
-
-			// wait for Downloader service to download all expected snapshots
-			if cfg.snapshots.IndicesMax() < cfg.snapshots.SegmentsMax() {
-				chainID, _ := uint256.FromBig(cfg.chainConfig.ChainID)
-				workers := cmp.InRange(1, 2, runtime.GOMAXPROCS(-1)-1)
-				if err := snapshotsync.BuildMissedIndices(ctx, cfg.snapshots.Dir(), *chainID, cfg.tmpdir, workers, log.LvlInfo); err != nil {
-					return fmt.Errorf("BuildMissedIndices: %w", err)
-				}
-			}
-
-			if err := cfg.snapshots.ReopenFolder(); err != nil {
-				return err
-			}
-			if cfg.dbEventNotifier != nil {
-				cfg.dbEventNotifier.OnNewSnapshot()
-			}
-		}
-	}
-
-	if s.BlockNumber < cfg.snapshots.BlocksAvailable() { // allow genesis
-		logEvery := time.NewTicker(logInterval)
-		defer logEvery.Stop()
-
-		h2n := etl.NewCollector("Snapshots", cfg.tmpdir, etl.NewSortableBuffer(etl.BufferOptimalSize))
-		defer h2n.Close()
-		h2n.LogLvl(log.LvlDebug)
-
-		// fill some small tables from snapshots, in future we may store this data in snapshots also, but
-		// for now easier just store them in db
-		td := big.NewInt(0)
-		if err := snapshotsync.ForEachHeader(ctx, cfg.snapshots, func(header *types.Header) error {
-			blockNum, blockHash := header.Number.Uint64(), header.Hash()
-			td.Add(td, header.Difficulty)
-			if err := rawdb.WriteTd(tx, blockHash, blockNum, td); err != nil {
-				return err
-			}
-			if err := rawdb.WriteCanonicalHash(tx, blockHash, blockNum); err != nil {
-				return err
-			}
-			if err := h2n.Collect(blockHash[:], dbutils.EncodeBlockNumber(blockNum)); err != nil {
-				return err
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-logEvery.C:
-				log.Info(fmt.Sprintf("[%s] Writing total difficulty index for snapshots", s.LogPrefix()), "block_num", header.Number.Uint64())
-			default:
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-		if err := h2n.Load(tx, kv.HeaderNumber, etl.IdentityLoadFunc, etl.TransformArgs{}); err != nil {
-			return err
-		}
-		// ResetSequence - allow set arbitrary value to sequence (for example to decrement it to exact value)
-		ok, err := cfg.snapshots.ViewTxs(cfg.snapshots.BlocksAvailable(), func(sn *snapshotsync.TxnSegment) error {
-			lastTxnID := sn.IdxTxnHash.BaseDataID() + uint64(sn.Seg.Count())
-			if err := rawdb.ResetSequence(tx, kv.EthTx, lastTxnID+1); err != nil {
-				return err
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("snapshot not found for block: %d", cfg.snapshots.BlocksAvailable())
-		}
-		canonicalHash, err := cfg.blockReader.CanonicalHash(ctx, tx, cfg.snapshots.BlocksAvailable())
-		if err != nil {
-			return err
-		}
-		if err = rawdb.WriteHeadHeaderHash(tx, canonicalHash); err != nil {
-			return err
-		}
-		if err := s.Update(tx, cfg.snapshots.BlocksAvailable()); err != nil {
-			return err
-		}
-		_ = stages.SaveStageProgress(tx, stages.Bodies, cfg.snapshots.BlocksAvailable())
-		_ = stages.SaveStageProgress(tx, stages.BlockHashes, cfg.snapshots.BlocksAvailable())
-		_ = stages.SaveStageProgress(tx, stages.Senders, cfg.snapshots.BlocksAvailable())
-		s.BlockNumber = cfg.snapshots.BlocksAvailable()
-	}
-
-	if err := cfg.hd.AddHeadersFromSnapshot(tx, cfg.snapshots.BlocksAvailable(), cfg.blockReader); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// WaitForDownloader - wait for Downloader service to download all expected snapshots
-// for MVP we sync with Downloader only once, in future will send new snapshots also
-func WaitForDownloader(ctx context.Context, cfg HeadersCfg, tx kv.RwTx) error {
-	if cfg.snapshots.Cfg().NoDownloader {
-		return nil
-	}
-
-	snInDB, err := rawdb.ReadSnapshots(tx)
-	if err != nil {
-		return err
-	}
-	dbEmpty := len(snInDB) == 0
-	var missingSnapshots []snapshotsync.Range
-	if !dbEmpty {
-		_, missingSnapshots, err = snapshotsync.Segments(cfg.snapshots.Dir())
-		if err != nil {
-			return err
-		}
-	}
-
-	if len(missingSnapshots) > 0 {
-		log.Warn("[Snapshots] downloading missing snapshots")
-	}
-
-	// send all hashes to the Downloader service
-	preverified := snapcfg.KnownCfg(cfg.chainConfig.ChainName, snInDB).Preverified
-	var downloadRequest []snapshotsync.DownloadRequest
-	// build all download requests
-	// builds preverified snapshots request
-	for _, p := range preverified {
-		downloadRequest = append(downloadRequest, snapshotsync.NewDownloadRequest(nil, p.Name, p.Hash))
-	}
-	// builds missing snapshots request
-	for i := range missingSnapshots {
-		downloadRequest = append(downloadRequest, snapshotsync.NewDownloadRequest(&missingSnapshots[i], "", ""))
-	}
-
-	log.Info("[Snapshots] Fetching torrent files metadata")
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		if err := snapshotsync.RequestSnapshotsDownload(ctx, downloadRequest, cfg.snapshotDownloader); err != nil {
-			log.Error("[Snapshots] call downloader", "err", err)
-			time.Sleep(10 * time.Second)
-			continue
-		}
-		break
-	}
-	logEvery := time.NewTicker(logInterval)
-	defer logEvery.Stop()
-	var m runtime.MemStats
-
-	// Check once without delay, for faster erigon re-start
-	stats, err := cfg.snapshotDownloader.Stats(ctx, &proto_downloader.StatsRequest{})
-	if err == nil && stats.Completed {
-		goto Finish
-	}
-
-	// Print download progress until all segments are available
-Loop:
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-logEvery.C:
-			if stats, err := cfg.snapshotDownloader.Stats(ctx, &proto_downloader.StatsRequest{}); err != nil {
-				log.Warn("Error while waiting for snapshots progress", "err", err)
-			} else if stats.Completed {
-				if !cfg.snapshots.Cfg().Verify { // will verify after loop
-					if _, err := cfg.snapshotDownloader.Verify(ctx, &proto_downloader.VerifyRequest{}); err != nil {
-						return err
-					}
-				}
-				break Loop
-			} else {
-				if stats.MetadataReady < stats.FilesTotal {
-					log.Info(fmt.Sprintf("[Snapshots] Waiting for torrents metadata: %d/%d", stats.MetadataReady, stats.FilesTotal))
-					continue
-				}
-				libcommon.ReadMemStats(&m)
-				log.Info("[Snapshots] download",
-					"progress", fmt.Sprintf("%.2f%% %s/%s", stats.Progress, libcommon.ByteCount(stats.BytesCompleted), libcommon.ByteCount(stats.BytesTotal)),
-					"download", libcommon.ByteCount(stats.DownloadRate)+"/s",
-					"upload", libcommon.ByteCount(stats.UploadRate)+"/s",
-					"peers", stats.PeersUnique,
-					"connections", stats.ConnectionsTotal,
-					"files", stats.FilesTotal,
-					"alloc", libcommon.ByteCount(m.Alloc), "sys", libcommon.ByteCount(m.Sys),
-				)
-			}
-		}
-	}
-
-Finish:
-	if cfg.snapshots.Cfg().Verify {
-		if _, err := cfg.snapshotDownloader.Verify(ctx, &proto_downloader.VerifyRequest{}); err != nil {
-			return err
-		}
-	}
-
-	if dbEmpty {
-		if err = rawdb.WriteSnapshots(tx, snInDB); err != nil {
 			return err
 		}
 	}

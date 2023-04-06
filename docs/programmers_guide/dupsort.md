@@ -68,7 +68,7 @@ for k, _ := cursor.SeekDup(subTableName, keyInSubTable); k != nil; k, _ = cursor
 } 
 ```
 
-Enough strait forward. No performance penalty (only profit from smaller database size).
+Enough straight forward. No performance penalty (only profit from smaller database size).
 
 MDBX in-depth
 -------------
@@ -153,7 +153,8 @@ Erigon
 This article target is to show tricky concepts on examples. Future
 reading [here](./db_walkthrough.MD#table-history-of-accounts)
 
-Erigon supports multiple typed cursors, see [AbstractKV.md](./../../ethdb/AbstractKV.md)
+Erigon supports multiple typed cursors, see the [KV
+Readme.md](https://github.com/ledgerwatch/erigon-lib/tree/main/kv)
 
 
 

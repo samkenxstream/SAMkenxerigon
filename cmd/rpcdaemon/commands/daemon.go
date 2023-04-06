@@ -1,12 +1,12 @@
 package commands
 
 import (
-	"github.com/ledgerwatch/erigon-lib/gointerfaces/starknet"
 	"github.com/ledgerwatch/erigon-lib/gointerfaces/txpool"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/kvcache"
 	libstate "github.com/ledgerwatch/erigon-lib/state"
 	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/cli/httpcfg"
+	"github.com/ledgerwatch/erigon/consensus"
 	"github.com/ledgerwatch/erigon/rpc"
 	"github.com/ledgerwatch/erigon/turbo/rpchelper"
 	"github.com/ledgerwatch/erigon/turbo/services"
@@ -14,16 +14,12 @@ import (
 
 // APIList describes the list of available RPC apis
 func APIList(db kv.RoDB, borDb kv.RoDB, eth rpchelper.ApiBackend, txPool txpool.TxpoolClient, mining txpool.MiningClient,
-	starknet starknet.CAIROVMClient, filters *rpchelper.Filters, stateCache kvcache.Cache,
-	blockReader services.FullBlockReader, agg *libstate.Aggregator22, txNums []uint64, cfg httpcfg.HttpCfg) (list []rpc.API) {
-
-	base := NewBaseApi(filters, stateCache, blockReader, agg, txNums, cfg.WithDatadir)
-	if cfg.TevmEnabled {
-		base.EnableTevmExperiment()
-	}
-	ethImpl := NewEthAPI(base, db, eth, txPool, mining, cfg.Gascap)
+	filters *rpchelper.Filters, stateCache kvcache.Cache,
+	blockReader services.FullBlockReader, agg *libstate.AggregatorV3, cfg httpcfg.HttpCfg, engine consensus.EngineReader,
+) (list []rpc.API) {
+	base := NewBaseApi(filters, stateCache, blockReader, agg, cfg.WithDatadir, cfg.EvmCallTimeout, engine, cfg.Dirs)
+	ethImpl := NewEthAPI(base, db, eth, txPool, mining, cfg.Gascap, cfg.ReturnDataLimit)
 	erigonImpl := NewErigonAPI(base, db, eth)
-	starknetImpl := NewStarknetAPI(base, db, starknet, txPool)
 	txpoolImpl := NewTxPoolAPI(base, db, txPool)
 	netImpl := NewNetAPIImpl(eth)
 	debugImpl := NewPrivateDebugAPI(base, db, cfg.Gascap)
@@ -33,6 +29,17 @@ func APIList(db kv.RoDB, borDb kv.RoDB, eth rpchelper.ApiBackend, txPool txpool.
 	adminImpl := NewAdminAPI(eth)
 	parityImpl := NewParityAPIImpl(db)
 	borImpl := NewBorAPI(base, db, borDb) // bor (consensus) specific
+	otsImpl := NewOtterscanAPI(base, db)
+	gqlImpl := NewGraphQLAPI(base, db)
+
+	if cfg.GraphQLEnabled {
+		list = append(list, rpc.API{
+			Namespace: "graphql",
+			Public:    true,
+			Service:   GraphQLAPI(gqlImpl),
+			Version:   "1.0",
+		})
+	}
 
 	for _, enabledAPI := range cfg.API {
 		switch enabledAPI {
@@ -92,13 +99,6 @@ func APIList(db kv.RoDB, borDb kv.RoDB, eth rpchelper.ApiBackend, txPool txpool.
 				Service:   ErigonAPI(erigonImpl),
 				Version:   "1.0",
 			})
-		case "starknet":
-			list = append(list, rpc.API{
-				Namespace: "starknet",
-				Public:    true,
-				Service:   StarknetAPI(starknetImpl),
-				Version:   "1.0",
-			})
 		case "bor":
 			list = append(list, rpc.API{
 				Namespace: "bor",
@@ -120,6 +120,13 @@ func APIList(db kv.RoDB, borDb kv.RoDB, eth rpchelper.ApiBackend, txPool txpool.
 				Service:   ParityAPI(parityImpl),
 				Version:   "1.0",
 			})
+		case "ots":
+			list = append(list, rpc.API{
+				Namespace: "ots",
+				Public:    true,
+				Service:   OtterscanAPI(otsImpl),
+				Version:   "1.0",
+			})
 		}
 	}
 
@@ -128,11 +135,13 @@ func APIList(db kv.RoDB, borDb kv.RoDB, eth rpchelper.ApiBackend, txPool txpool.
 
 func AuthAPIList(db kv.RoDB, eth rpchelper.ApiBackend, txPool txpool.TxpoolClient, mining txpool.MiningClient,
 	filters *rpchelper.Filters, stateCache kvcache.Cache, blockReader services.FullBlockReader,
-	cfg httpcfg.HttpCfg) (list []rpc.API) {
-	base := NewBaseApi(filters, stateCache, blockReader, nil, nil, cfg.WithDatadir)
+	agg *libstate.AggregatorV3,
+	cfg httpcfg.HttpCfg, engine consensus.EngineReader,
+) (list []rpc.API) {
+	base := NewBaseApi(filters, stateCache, blockReader, agg, cfg.WithDatadir, cfg.EvmCallTimeout, engine, cfg.Dirs)
 
-	ethImpl := NewEthAPI(base, db, eth, txPool, mining, cfg.Gascap)
-	engineImpl := NewEngineAPI(base, db, eth)
+	ethImpl := NewEthAPI(base, db, eth, txPool, mining, cfg.Gascap, cfg.ReturnDataLimit)
+	engineImpl := NewEngineAPI(base, db, eth, cfg.InternalCL)
 
 	list = append(list, rpc.API{
 		Namespace: "eth",

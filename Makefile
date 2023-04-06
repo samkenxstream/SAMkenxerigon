@@ -18,25 +18,32 @@ DOCKER_TAG ?= thorax/erigon:latest
 # Go to be available, but with docker it's not strictly necessary
 CGO_CFLAGS := $(shell $(GO) env CGO_CFLAGS 2>/dev/null) # don't lose default
 CGO_CFLAGS += -DMDBX_FORCE_ASSERTIONS=0 # Enable MDBX's asserts by default in 'devel' branch and disable in releases
+#CGO_CFLAGS += -DMDBX_DISABLE_VALIDATION=1 # This feature is not ready yet
+#CGO_CFLAGS += -DMDBX_ENABLE_PROFGC=0 # Disabled by default, but may be useful for performance debugging
+#CGO_CFLAGS += -DMDBX_ENABLE_PGOP_STAT=0 # Disabled by default, but may be useful for performance debugging
+#CGO_CFLAGS += -DMDBX_ENV_CHECKPID=0 # Erigon doesn't do fork() syscall
+CGO_CFLAGS += -O
+CGO_CFLAGS += -D__BLST_PORTABLE__
+CGO_CFLAGS += -Wno-error=strict-prototypes # for Clang15, remove it when can https://github.com/ledgerwatch/erigon/issues/6113#issuecomment-1359526277
 CGO_CFLAGS := CGO_CFLAGS="$(CGO_CFLAGS)"
 DBG_CGO_CFLAGS += -DMDBX_DEBUG=1
 
-BUILD_TAGS = nosqlite,noboltdb
+BUILD_TAGS = nosqlite,noboltdb,netgo # about netgo see: https://github.com/golang/go/issues/30310#issuecomment-471669125
 PACKAGE = github.com/ledgerwatch/erigon
 
 GO_FLAGS += -trimpath -tags $(BUILD_TAGS) -buildvcs=false
 GO_FLAGS += -ldflags "-X ${PACKAGE}/params.GitCommit=${GIT_COMMIT} -X ${PACKAGE}/params.GitBranch=${GIT_BRANCH} -X ${PACKAGE}/params.GitTag=${GIT_TAG}"
 
 GOBUILD = $(CGO_CFLAGS) $(GO) build $(GO_FLAGS)
-GO_DBG_BUILD = $(DBG_CGO_CFLAGS) $(GO) build $(GO_FLAGS) -tags $(BUILD_TAGS),debug -gcflags=all="-N -l"  # see delve docs
-GOTEST = GODEBUG=cgocheck=0 $(GO) test $(GO_FLAGS) ./... -p 2
+GO_DBG_BUILD = $(GO) build $(GO_FLAGS) -tags $(BUILD_TAGS),debug -gcflags=all="-N -l"  # see delve docs
+GOTEST = $(CGO_CFLAGS) GODEBUG=cgocheck=0 $(GO) test $(GO_FLAGS) ./... -p 2
 
 default: all
 
 ## go-version:                        print and verify go version
 go-version:
-	@if [ $(shell $(GO) version | cut -c 16-17) -lt 18 ]; then \
-		echo "minimum required Golang version is 1.18"; \
+	@if [ $(shell $(GO) version | cut -c 16-17) -lt 19 ]; then \
+		echo "minimum required Golang version is 1.19"; \
 		exit 1 ;\
 	fi
 
@@ -56,7 +63,7 @@ validate_docker_build_args:
 ## docker:                            validate, update submodules and build with docker
 docker: validate_docker_build_args git-submodules
 	DOCKER_BUILDKIT=1 $(DOCKER) build -t ${DOCKER_TAG} \
-		--build-arg "BUILD_DATE=$(shell date -Iseconds)" \
+		--build-arg "BUILD_DATE=$(shell date +"%Y-%m-%dT%H:%M:%S:%z")" \
 		--build-arg VCS_REF=${GIT_COMMIT} \
 		--build-arg VERSION=${GIT_TAG} \
 		--build-arg UID=${DOCKER_UID} \
@@ -98,19 +105,24 @@ geth: erigon
 erigon: go-version erigon.cmd
 	@rm -f $(GOBIN)/tg # Remove old binary to prevent confusion where users still use it because of the scripts
 
-COMMANDS += cons
-COMMANDS += devnettest
+COMMANDS += devnet
+COMMANDS += erigon-el-mock
 COMMANDS += downloader
+COMMANDS += erigon-cl
 COMMANDS += hack
 COMMANDS += integration
 COMMANDS += observer
 COMMANDS += pics
 COMMANDS += rpcdaemon
-COMMANDS += rpcdaemon22
 COMMANDS += rpctest
 COMMANDS += sentry
 COMMANDS += state
 COMMANDS += txpool
+COMMANDS += verkle
+COMMANDS += evm
+COMMANDS += lightclient
+COMMANDS += sentinel
+COMMANDS += erigon-el
 
 # build each command using %.cmd rule
 $(COMMANDS): %: %.cmd
@@ -119,29 +131,28 @@ $(COMMANDS): %: %.cmd
 all: erigon $(COMMANDS)
 
 ## db-tools:                          build db tools
-db-tools: git-submodules
+db-tools:
 	@echo "Building db-tools"
 
-	@# hub.docker.com setup incorrect gitpath for git modules. Just remove it and re-init submodule.
-	rm -rf libmdbx
-	git submodule update --init --recursive --force libmdbx
-
-	cd libmdbx && MDBX_BUILD_TIMESTAMP=unknown make tools
-	cp libmdbx/mdbx_chk $(GOBIN)
-	cp libmdbx/mdbx_copy $(GOBIN)
-	cp libmdbx/mdbx_dump $(GOBIN)
-	cp libmdbx/mdbx_drop $(GOBIN)
-	cp libmdbx/mdbx_load $(GOBIN)
-	cp libmdbx/mdbx_stat $(GOBIN)
+	go mod vendor
+	cd vendor/github.com/torquem-ch/mdbx-go && MDBX_BUILD_TIMESTAMP=unknown make tools
+	cd vendor/github.com/torquem-ch/mdbx-go/mdbxdist && cp mdbx_chk $(GOBIN) && cp mdbx_copy $(GOBIN) && cp mdbx_dump $(GOBIN) && cp mdbx_drop $(GOBIN) && cp mdbx_load $(GOBIN) && cp mdbx_stat $(GOBIN)
+	rm -rf vendor
 	@echo "Run \"$(GOBIN)/mdbx_stat -h\" to get info about mdbx db file."
 
-## test:                              run unit tests with a 50s timeout
+## test:                              run unit tests with a 100s timeout
 test:
-	$(GOTEST) --timeout 50s
+	$(GOTEST) --timeout 100s
+
+test3:
+	$(GOTEST) --timeout 100s -tags $(BUILD_TAGS),erigon3
 
 ## test-integration:                  run integration tests with a 30m timeout
 test-integration:
 	$(GOTEST) --timeout 30m -tags $(BUILD_TAGS),integration
+
+test3-integration:
+	$(GOTEST) --timeout 30m -tags $(BUILD_TAGS),integration,erigon3
 
 ## lint:                              run golangci-lint with .golangci.yml config file
 lint:
@@ -155,13 +166,12 @@ lintci:
 ## lintci-deps:                       (re)installs golangci-lint to build/bin/golangci-lint
 lintci-deps:
 	rm -f ./build/bin/golangci-lint
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b ./build/bin v1.48.0
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b ./build/bin v1.52.1
 
 ## clean:                             cleans the go cache, build dir, libmdbx db dir
 clean:
 	go clean -cache
 	rm -fr build/*
-	cd libmdbx/ && make clean
 
 # The devtools target installs tools required for 'go generate'.
 # You need to put $GOBIN (or $GOPATH/bin) in your PATH to use 'go generate'.
@@ -171,10 +181,10 @@ devtools:
 	# Notice! If you adding new binary - add it also to cmd/hack/binary-deps/main.go file
 	$(GOBUILD) -o $(GOBIN)/go-bindata github.com/kevinburke/go-bindata/go-bindata
 	$(GOBUILD) -o $(GOBIN)/gencodec github.com/fjl/gencodec
-	$(GOBUILD) -o $(GOBIN)/codecgen github.com/ugorji/go/codec/codecgen
 	$(GOBUILD) -o $(GOBIN)/abigen ./cmd/abigen
+	$(GOBUILD) -o $(GOBIN)/codecgen github.com/ugorji/go/codec/codecgen
 	PATH=$(GOBIN):$(PATH) go generate ./common
-	PATH=$(GOBIN):$(PATH) go generate ./core/types
+#	PATH=$(GOBIN):$(PATH) go generate ./core/types
 	PATH=$(GOBIN):$(PATH) go generate ./consensus/aura/...
 	#PATH=$(GOBIN):$(PATH) go generate ./eth/ethconfig/...
 	@type "npm" 2> /dev/null || echo 'Please install node.js and npm'
@@ -202,6 +212,42 @@ git-submodules:
 	@# these lines will also fail if ran as root in a non-root user's checked out repository
 	@git submodule sync --quiet --recursive || true
 	@git submodule update --quiet --init --recursive --force || true
+
+PACKAGE_NAME          := github.com/ledgerwatch/erigon
+GOLANG_CROSS_VERSION  ?= v1.20.2
+
+.PHONY: release-dry-run
+release-dry-run: git-submodules
+	@docker run \
+		--rm \
+		--privileged \
+		-e CGO_ENABLED=1 \
+		-e GITHUB_TOKEN \
+		-e DOCKER_USERNAME \
+		-e DOCKER_PASSWORD \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v `pwd`:/go/src/$(PACKAGE_NAME) \
+		-w /go/src/$(PACKAGE_NAME) \
+		ghcr.io/goreleaser/goreleaser-cross:${GOLANG_CROSS_VERSION} \
+		--clean --skip-validate --skip-publish
+
+.PHONY: release
+release: git-submodules
+	@docker run \
+		--rm \
+		--privileged \
+		-e CGO_ENABLED=1 \
+		-e GITHUB_TOKEN \
+		-e DOCKER_USERNAME \
+		-e DOCKER_PASSWORD \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v `pwd`:/go/src/$(PACKAGE_NAME) \
+		-w /go/src/$(PACKAGE_NAME) \
+		ghcr.io/goreleaser/goreleaser-cross:${GOLANG_CROSS_VERSION} \
+		--clean --skip-validate
+
+	@docker image push --all-tags thorax/erigon
+	@docker image push --all-tags ghcr.io/ledgerwatch/erigon
 
 # since DOCKER_UID, DOCKER_GID are default initialized to the current user uid/gid,
 # we need separate envvars to facilitate creation of the erigon user on the host OS.
@@ -234,10 +280,22 @@ user_macos:
 	sudo -u $(ERIGON_USER) mkdir -p $(ERIGON_USER_XDG_DATA_HOME)
 
 ## coverage:                          run code coverage report and output total coverage %
+.PHONY: coverage
 coverage:
 	@go test -coverprofile=coverage.out ./... > /dev/null 2>&1 && go tool cover -func coverage.out | grep total | awk '{print substr($$3, 1, length($$3)-1)}'
+
+## hive:                              run hive test suite locally using docker e.g. OUTPUT_DIR=~/results/hive SIM=ethereum/engine make hive
+.PHONY: hive
+hive:
+	DOCKER_TAG=thorax/erigon:ci-local make docker
+	docker pull thorax/hive:latest
+	docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v $(OUTPUT_DIR):/work thorax/hive:latest --sim $(SIM) --results-root=/work/results --client erigon_ci-local # run erigon
+
+## automated-tests                    run automated tests (BUILD_ERIGON=0 to prevent erigon build with local image tag)
+.PHONY: automated-tests
+automated-tests:
+	./tests/automated-testing/run.sh
 
 ## help:                              print commands help
 help	:	Makefile
 	@sed -n 's/^##//p' $<
-

@@ -21,80 +21,76 @@ import (
 	"math/big"
 
 	"github.com/holiman/uint256"
-	"github.com/ledgerwatch/erigon/common"
+	"github.com/ledgerwatch/erigon-lib/chain"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
+
 	"github.com/ledgerwatch/erigon/consensus"
 	"github.com/ledgerwatch/erigon/consensus/serenity"
 	"github.com/ledgerwatch/erigon/core/types"
-	"github.com/ledgerwatch/erigon/core/vm"
-	"github.com/ledgerwatch/erigon/params"
+	"github.com/ledgerwatch/erigon/core/vm/evmtypes"
 )
 
 // NewEVMBlockContext creates a new context for use in the EVM.
-func NewEVMBlockContext(header *types.Header, blockHashFunc func(n uint64) common.Hash, engine consensus.Engine, author *common.Address, contractHasTEVM func(contractHash common.Hash) (bool, error)) vm.BlockContext {
+// excessDataGas must be set to the excessDataGas value from the *parent* block header, and can be
+// nil if the parent block is not of EIP-4844 type. It is read only.
+func NewEVMBlockContext(header *types.Header, blockHashFunc func(n uint64) libcommon.Hash, engine consensus.EngineReader, author *libcommon.Address, excessDataGas *big.Int) evmtypes.BlockContext {
 	// If we don't have an explicit author (i.e. not mining), extract from the header
-	var beneficiary common.Address
+	var beneficiary libcommon.Address
 	if author == nil {
 		beneficiary, _ = engine.Author(header) // Ignore error, we're past header validation
 	} else {
 		beneficiary = *author
 	}
 	var baseFee uint256.Int
-	if header.Eip1559 {
+	if header.BaseFee != nil {
 		overflow := baseFee.SetFromBig(header.BaseFee)
 		if overflow {
 			panic(fmt.Errorf("header.BaseFee higher than 2^256-1"))
 		}
 	}
 
-	var prevRandDao *common.Hash
+	var prevRandDao *libcommon.Hash
 	if header.Difficulty.Cmp(serenity.SerenityDifficulty) == 0 {
 		// EIP-4399. We use SerenityDifficulty (i.e. 0) as a telltale of Proof-of-Stake blocks.
 		prevRandDao = &header.MixDigest
 	}
 
-	if contractHasTEVM == nil {
-		contractHasTEVM = func(_ common.Hash) (bool, error) {
-			return false, nil
-		}
-	}
-
-	var transferFunc vm.TransferFunc
-	if engine != nil && engine.Type() == params.BorConsensus {
+	var transferFunc evmtypes.TransferFunc
+	if engine != nil && engine.Type() == chain.BorConsensus {
 		transferFunc = BorTransfer
 	} else {
 		transferFunc = Transfer
 	}
 
-	return vm.BlockContext{
-		CanTransfer:     CanTransfer,
-		Transfer:        transferFunc,
-		GetHash:         blockHashFunc,
-		Coinbase:        beneficiary,
-		BlockNumber:     header.Number.Uint64(),
-		Time:            header.Time,
-		Difficulty:      new(big.Int).Set(header.Difficulty),
-		BaseFee:         &baseFee,
-		GasLimit:        header.GasLimit,
-		ContractHasTEVM: contractHasTEVM,
-		PrevRanDao:      prevRandDao,
+	return evmtypes.BlockContext{
+		CanTransfer: CanTransfer,
+		Transfer:    transferFunc,
+		GetHash:     blockHashFunc,
+		Coinbase:    beneficiary,
+		BlockNumber: header.Number.Uint64(),
+		Time:        header.Time,
+		Difficulty:  new(big.Int).Set(header.Difficulty),
+		BaseFee:     &baseFee,
+		GasLimit:    header.GasLimit,
+		PrevRanDao:  prevRandDao,
 	}
 }
 
 // NewEVMTxContext creates a new transaction context for a single transaction.
-func NewEVMTxContext(msg Message) vm.TxContext {
-	return vm.TxContext{
+func NewEVMTxContext(msg Message) evmtypes.TxContext {
+	return evmtypes.TxContext{
 		Origin:   msg.From(),
-		GasPrice: msg.GasPrice().ToBig(),
+		GasPrice: msg.GasPrice(),
 	}
 }
 
 // GetHashFn returns a GetHashFunc which retrieves header hashes by number
-func GetHashFn(ref *types.Header, getHeader func(hash common.Hash, number uint64) *types.Header) func(n uint64) common.Hash {
+func GetHashFn(ref *types.Header, getHeader func(hash libcommon.Hash, number uint64) *types.Header) func(n uint64) libcommon.Hash {
 	// Cache will initially contain [refHash.parent],
 	// Then fill up with [refHash.p, refHash.pp, refHash.ppp, ...]
-	var cache []common.Hash
+	var cache []libcommon.Hash
 
-	return func(n uint64) common.Hash {
+	return func(n uint64) libcommon.Hash {
 		// If there's no hash cache yet, make one
 		if len(cache) == 0 {
 			cache = append(cache, ref.ParentHash)
@@ -118,18 +114,18 @@ func GetHashFn(ref *types.Header, getHeader func(hash common.Hash, number uint64
 				return lastKnownHash
 			}
 		}
-		return common.Hash{}
+		return libcommon.Hash{}
 	}
 }
 
 // CanTransfer checks whether there are enough funds in the address' account to make a transfer.
 // This does not take the necessary gas in to account to make the transfer valid.
-func CanTransfer(db vm.IntraBlockState, addr common.Address, amount *uint256.Int) bool {
+func CanTransfer(db evmtypes.IntraBlockState, addr libcommon.Address, amount *uint256.Int) bool {
 	return !db.GetBalance(addr).Lt(amount)
 }
 
 // Transfer subtracts amount from sender and adds amount to recipient using the given Db
-func Transfer(db vm.IntraBlockState, sender, recipient common.Address, amount *uint256.Int, bailout bool) {
+func Transfer(db evmtypes.IntraBlockState, sender, recipient libcommon.Address, amount *uint256.Int, bailout bool) {
 	if !bailout {
 		db.SubBalance(sender, amount)
 	}
@@ -137,7 +133,7 @@ func Transfer(db vm.IntraBlockState, sender, recipient common.Address, amount *u
 }
 
 // BorTransfer transfer in Bor
-func BorTransfer(db vm.IntraBlockState, sender, recipient common.Address, amount *uint256.Int, bailout bool) {
+func BorTransfer(db evmtypes.IntraBlockState, sender, recipient libcommon.Address, amount *uint256.Int, bailout bool) {
 	// get inputs before
 	input1 := db.GetBalance(sender).Clone()
 	input2 := db.GetBalance(recipient).Clone()

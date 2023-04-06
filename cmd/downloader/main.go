@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/anacrolix/torrent/metainfo"
@@ -13,14 +15,17 @@ import (
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
 	"github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/common/datadir"
+	"github.com/ledgerwatch/erigon-lib/downloader"
+	downloadercfg2 "github.com/ledgerwatch/erigon-lib/downloader/downloadercfg"
 	proto_downloader "github.com/ledgerwatch/erigon-lib/gointerfaces/downloader"
-	"github.com/ledgerwatch/erigon/cmd/downloader/downloader"
-	"github.com/ledgerwatch/erigon/cmd/downloader/downloader/downloadercfg"
+	"github.com/ledgerwatch/erigon/cmd/downloader/downloadernat"
 	"github.com/ledgerwatch/erigon/cmd/utils"
 	"github.com/ledgerwatch/erigon/common/paths"
-	"github.com/ledgerwatch/erigon/internal/debug"
-	"github.com/ledgerwatch/erigon/node/nodecfg/datadir"
 	"github.com/ledgerwatch/erigon/p2p/nat"
+	"github.com/ledgerwatch/erigon/params"
+	"github.com/ledgerwatch/erigon/turbo/debug"
+	logging2 "github.com/ledgerwatch/erigon/turbo/logging"
 	"github.com/ledgerwatch/log/v3"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/spf13/cobra"
@@ -41,15 +46,17 @@ var (
 	torrentVerbosity               int
 	downloadRateStr, uploadRateStr string
 	torrentDownloadSlots           int
+	staticPeersStr                 string
 	torrentPort                    int
 	torrentMaxPeers                int
 	torrentConnsPerFile            int
 	targetFile                     string
+	disableIPV6                    bool
+	disableIPV4                    bool
 )
 
 func init() {
-	flags := append(debug.Flags, utils.MetricFlags...)
-	utils.CobraFlags(rootCmd, flags)
+	utils.CobraFlags(rootCmd, debug.Flags, utils.MetricFlags, logging2.Flags)
 
 	withDataDir(rootCmd)
 
@@ -62,6 +69,9 @@ func init() {
 	rootCmd.Flags().IntVar(&torrentMaxPeers, "torrent.maxpeers", utils.TorrentMaxPeersFlag.Value, utils.TorrentMaxPeersFlag.Usage)
 	rootCmd.Flags().IntVar(&torrentConnsPerFile, "torrent.conns.perfile", utils.TorrentConnsPerFileFlag.Value, utils.TorrentConnsPerFileFlag.Usage)
 	rootCmd.Flags().IntVar(&torrentDownloadSlots, "torrent.download.slots", utils.TorrentDownloadSlotsFlag.Value, utils.TorrentDownloadSlotsFlag.Usage)
+	rootCmd.Flags().StringVar(&staticPeersStr, utils.TorrentStaticPeersFlag.Name, utils.TorrentStaticPeersFlag.Value, utils.TorrentStaticPeersFlag.Usage)
+	rootCmd.Flags().BoolVar(&disableIPV6, "downloader.disable.ipv6", utils.DisableIPV6.Value, utils.DisableIPV6.Usage)
+	rootCmd.Flags().BoolVar(&disableIPV4, "downloader.disable.ipv4", utils.DisableIPV4.Value, utils.DisableIPV6.Usage)
 
 	withDataDir(printTorrentHashes)
 	printTorrentHashes.PersistentFlags().BoolVar(&forceRebuild, "rebuild", false, "Force re-create .torrent files")
@@ -103,18 +113,20 @@ var rootCmd = &cobra.Command{
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
 		debug.Exit()
 	},
-	RunE: func(cmd *cobra.Command, args []string) error {
+	Run: func(cmd *cobra.Command, args []string) {
+		_ = logging2.GetLoggerCmd("downloader", cmd)
 		if err := Downloader(cmd.Context()); err != nil {
-			log.Error("Downloader", "err", err)
-			return nil
+			if !errors.Is(err, context.Canceled) {
+				log.Error(err.Error())
+			}
+			return
 		}
-		return nil
 	},
 }
 
 func Downloader(ctx context.Context) error {
 	dirs := datadir.New(datadirCli)
-	torrentLogLevel, dbg, err := downloadercfg.Int2LogLevel(torrentVerbosity)
+	torrentLogLevel, _, err := downloadercfg2.Int2LogLevel(torrentVerbosity)
 	if err != nil {
 		return err
 	}
@@ -127,24 +139,30 @@ func Downloader(ctx context.Context) error {
 		return err
 	}
 
-	log.Info("Run snapshot downloader", "addr", downloaderApiAddr, "datadir", dirs.DataDir, "download.rate", downloadRate.String(), "upload.rate", uploadRate.String())
+	log.Info("Run snapshot downloader", "addr", downloaderApiAddr, "datadir", dirs.DataDir, "ipv6-enabled", !disableIPV6, "ipv4-enabled", !disableIPV4, "download.rate", downloadRate.String(), "upload.rate", uploadRate.String())
 	natif, err := nat.Parse(natSetting)
 	if err != nil {
 		return fmt.Errorf("invalid nat option %s: %w", natSetting, err)
 	}
+	staticPeers := strings.Split(staticPeersStr, ",")
 
-	cfg, err := downloadercfg.New(dirs.Snap, torrentLogLevel, dbg, natif, downloadRate, uploadRate, torrentPort, torrentConnsPerFile, torrentDownloadSlots)
+	version := "erigon: " + params.VersionWithCommit(params.GitCommit)
+	cfg, err := downloadercfg2.New(dirs.Snap, version, torrentLogLevel, downloadRate, uploadRate, torrentPort, torrentConnsPerFile, torrentDownloadSlots, staticPeers)
 	if err != nil {
 		return err
 	}
+	downloadernat.DoNat(natif, cfg)
 
-	d, err := downloader.New(cfg)
+	cfg.ClientConfig.DisableIPv6 = disableIPV6
+	cfg.ClientConfig.DisableIPv4 = disableIPV4
+
+	d, err := downloader.New(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer d.Close()
 	log.Info("[torrent] Start", "my peerID", fmt.Sprintf("%x", d.Torrent().PeerID()))
-	go downloader.MainLoop(ctx, d, false)
+	d.MainLoopInBackground(ctx, false)
 
 	bittorrentServer, err := downloader.NewGrpcServer(d)
 	if err != nil {
@@ -183,7 +201,7 @@ var printTorrentHashes = &cobra.Command{
 					return err
 				}
 			}
-			if err := downloader.BuildTorrentFilesIfNeed(ctx, dirs.Snap); err != nil {
+			if _, err := downloader.BuildTorrentFilesIfNeed(ctx, dirs.Snap); err != nil {
 				return err
 			}
 		}

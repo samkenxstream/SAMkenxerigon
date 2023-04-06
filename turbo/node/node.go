@@ -3,6 +3,9 @@ package node
 
 import (
 	"github.com/ledgerwatch/erigon-lib/kv"
+	"github.com/ledgerwatch/log/v3"
+	"github.com/urfave/cli/v2"
+
 	"github.com/ledgerwatch/erigon/cmd/utils"
 	"github.com/ledgerwatch/erigon/eth"
 	"github.com/ledgerwatch/erigon/eth/ethconfig"
@@ -11,9 +14,6 @@ import (
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/params/networkname"
 	erigoncli "github.com/ledgerwatch/erigon/turbo/cli"
-	"github.com/ledgerwatch/log/v3"
-
-	"github.com/urfave/cli"
 )
 
 // ErigonNode represents a single node, that runs sync and p2p network.
@@ -52,22 +52,14 @@ type Params struct {
 
 func NewNodConfigUrfave(ctx *cli.Context) *nodecfg.Config {
 	// If we're running a known preset, log it for convenience.
-	chain := ctx.GlobalString(utils.ChainFlag.Name)
+	chain := ctx.String(utils.ChainFlag.Name)
 	switch chain {
 	case networkname.SepoliaChainName:
 		log.Info("Starting Erigon on Sepolia testnet...")
-	case networkname.RopstenChainName:
-		log.Info("Starting Erigon on Ropsten testnet...")
 	case networkname.RinkebyChainName:
 		log.Info("Starting Erigon on Rinkeby testnet...")
 	case networkname.GoerliChainName:
 		log.Info("Starting Erigon on Görli testnet...")
-	case networkname.BSCChainName:
-		log.Info("Starting Erigon on BSC mainnet...")
-	case networkname.ChapelChainName:
-		log.Info("Starting Erigon on Chapel testnet...")
-	case networkname.RialtoChainName:
-		log.Info("Starting Erigon on Chapel testnet...")
 	case networkname.DevChainName:
 		log.Info("Starting Erigon in ephemeral dev mode...")
 	case networkname.MumbaiChainName:
@@ -77,7 +69,7 @@ func NewNodConfigUrfave(ctx *cli.Context) *nodecfg.Config {
 	case networkname.BorDevnetChainName:
 		log.Info("Starting Erigon on Bor Devnet...")
 	case "", networkname.MainnetChainName:
-		if !ctx.GlobalIsSet(utils.NetworkIdFlag.Name) {
+		if !ctx.IsSet(utils.NetworkIdFlag.Name) {
 			log.Info("Starting Erigon on Ethereum mainnet...")
 		}
 	default:
@@ -116,6 +108,10 @@ func New(
 	if err != nil {
 		return nil, err
 	}
+	err = ethereum.Init(node, ethConfig)
+	if err != nil {
+		return nil, err
+	}
 	return &ErigonNode{stack: node, backend: ethereum}, nil
 }
 
@@ -123,7 +119,7 @@ func NewNodeConfig() *nodecfg.Config {
 	nodeConfig := nodecfg.DefaultConfig
 	// see simiar changes in `cmd/geth/config.go#defaultNodeConfig`
 	if commit := params.GitCommit; commit != "" {
-		nodeConfig.Version = params.VersionWithCommit(commit, "")
+		nodeConfig.Version = params.VersionWithCommit(commit)
 	} else {
 		nodeConfig.Version = params.Version
 	}

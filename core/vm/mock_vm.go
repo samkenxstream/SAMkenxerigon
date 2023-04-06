@@ -5,8 +5,8 @@ import (
 	"math/big"
 
 	"github.com/holiman/uint256"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
 
-	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/core/state"
 )
 
@@ -17,7 +17,6 @@ type readonlyGetSetter interface {
 
 type testVM struct {
 	readonlyGetSetter
-	isTEMV bool
 
 	recordedReadOnlies  *[]*readOnlyState
 	recordedIsEVMCalled *[]bool
@@ -45,7 +44,7 @@ func (evm *testVM) Run(_ *Contract, _ []byte, readOnly bool) (ret []byte, err er
 	currentReadOnly.in = evm.getReadonly()
 
 	(*evm.recordedReadOnlies)[currentIndex] = currentReadOnly
-	(*evm.recordedIsEVMCalled)[currentIndex] = !evm.isTEMV
+	(*evm.recordedIsEVMCalled)[currentIndex] = true
 
 	*evm.currentIdx++
 
@@ -56,12 +55,15 @@ func (evm *testVM) Run(_ *Contract, _ []byte, readOnly bool) (ret []byte, err er
 			new(uint256.Int),
 			0,
 			false,
-			!evm.isEVMSliceTest[*evm.currentIdx],
 		), nil, evm.readOnlySliceTest[*evm.currentIdx])
 		return res, err
 	}
 
 	return
+}
+
+func (evm *testVM) Depth() int {
+	return 0
 }
 
 type readOnlyState struct {
@@ -79,11 +81,11 @@ type dummyContractRef struct {
 	calledForEach bool
 }
 
-func (dummyContractRef) ReturnGas(*big.Int)          {}
-func (dummyContractRef) Address() common.Address     { return common.Address{} }
-func (dummyContractRef) Value() *big.Int             { return new(big.Int) }
-func (dummyContractRef) SetCode(common.Hash, []byte) {}
-func (d *dummyContractRef) ForEachStorage(callback func(key, value common.Hash) bool) {
+func (dummyContractRef) ReturnGas(*big.Int)             {}
+func (dummyContractRef) Address() libcommon.Address     { return libcommon.Address{} }
+func (dummyContractRef) Value() *big.Int                { return new(big.Int) }
+func (dummyContractRef) SetCode(libcommon.Hash, []byte) {}
+func (d *dummyContractRef) ForEachStorage(callback func(key, value libcommon.Hash) bool) {
 	d.calledForEach = true
 }
 func (d *dummyContractRef) SubBalance(amount *big.Int) {}

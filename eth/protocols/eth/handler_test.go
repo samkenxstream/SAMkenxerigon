@@ -21,9 +21,11 @@ import (
 	"testing"
 
 	"github.com/holiman/uint256"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/gointerfaces/sentry"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/common"
+	"github.com/stretchr/testify/require"
+
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/types"
@@ -32,7 +34,6 @@ import (
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rlp"
 	"github.com/ledgerwatch/erigon/turbo/stages"
-	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -84,7 +85,7 @@ func TestGetBlockReceipts(t *testing.T) {
 
 	// Collect the hashes to request, and the response to expect
 	var (
-		hashes   []common.Hash
+		hashes   []libcommon.Hash
 		receipts []rlp.RawValue
 	)
 
@@ -118,18 +119,22 @@ func TestGetBlockReceipts(t *testing.T) {
 
 	expect, err := rlp.EncodeToBytes(eth.ReceiptsRLPPacket66{RequestId: 1, ReceiptsRLPPacket: receipts})
 	require.NoError(t, err)
-	m.ReceiveWg.Wait()
-	sent := m.SentMessage(0)
-	require.Equal(t, eth.ToProto[m.SentryClient.Protocol()][eth.ReceiptsMsg], sent.Id)
-	require.Equal(t, expect, sent.Data)
+	if m.HistoryV3 {
+		// GetReceiptsMsg disabled for historyV3
+	} else {
+		m.ReceiveWg.Wait()
+		sent := m.SentMessage(0)
+		require.Equal(t, eth.ToProto[m.SentryClient.Protocol()][eth.ReceiptsMsg], sent.Id)
+		require.Equal(t, expect, sent.Data)
+	}
 }
 
 // newTestBackend creates a chain with a number of explicitly defined blocks and
 // wraps it into a mock backend.
 func mockWithGenerator(t *testing.T, blocks int, generator func(int, *core.BlockGen)) *stages.MockSentry {
-	m := stages.MockWithGenesis(t, &core.Genesis{
+	m := stages.MockWithGenesis(t, &types.Genesis{
 		Config: params.TestChainConfig,
-		Alloc:  core.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000)}},
+		Alloc:  types.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000)}},
 	}, testKey, false)
 	if blocks > 0 {
 		chain, _ := core.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, blocks, generator, true)

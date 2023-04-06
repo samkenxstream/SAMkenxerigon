@@ -6,15 +6,13 @@ on:
 
 jobs:
   coverage:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v3
-      - run: git submodule update --init --recursive --force
-
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
-          go-version: 1.18.x
+          go-version: '1.19'
 
       - name: install dependencies on Linux
         if: runner.os == 'Linux'
@@ -51,5 +49,5 @@ jobs:
         uses: andymckay/append-gist-action@1fbfbbce708a39bd45846f0955ed5521f2099c6d
         with:
           token: ${{ secrets.GIST_TOKEN }}
-          gistURL: https://gist.githubusercontent.com/revittm/ee38e9beb22353eef6b88f2ad6ed7aa9
+          gistURL: https://gist.githubusercontent.com/revitteth/ee38e9beb22353eef6b88f2ad6ed7aa9
           file: badge.svg

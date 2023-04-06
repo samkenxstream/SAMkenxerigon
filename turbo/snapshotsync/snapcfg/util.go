@@ -12,17 +12,23 @@ import (
 	"golang.org/x/exp/slices"
 )
 
-var Mainnet = fromToml(snapshothashes.Mainnet)
+var (
+	Mainnet    = fromToml(snapshothashes.Mainnet)
+	Sepolia    = fromToml(snapshothashes.Sepolia)
+	Goerli     = fromToml(snapshothashes.Goerli)
+	Mumbai     = fromToml(snapshothashes.Mumbai)
+	BorMainnet = fromToml(snapshothashes.BorMainnet)
+	Gnosis     = fromToml(snapshothashes.Gnosis)
+	Chiado     = fromToml(snapshothashes.Chiado)
 
-var Goerli = fromToml(snapshothashes.Goerli)
-
-var Bsc = fromToml(snapshothashes.Bsc)
-
-var Ropsten = fromToml(snapshothashes.Ropsten)
-
-var Mumbai = fromToml(snapshothashes.Mumbai)
-
-var BorMainnet = fromToml(snapshothashes.BorMainnet)
+	MainnetHistory    = fromToml(snapshothashes.MainnetHistory)
+	SepoliaHistory    = fromToml(snapshothashes.SepoliaHistory)
+	GoerliHistory     = fromToml(snapshothashes.GoerliHistory)
+	MumbaiHistory     = fromToml(snapshothashes.MumbaiHistory)
+	BorMainnetHistory = fromToml(snapshothashes.BorMainnetHistory)
+	GnosisHistory     = fromToml(snapshothashes.GnosisHistory)
+	ChiadoHistory     = fromToml(snapshothashes.ChiadoHistory)
+)
 
 type PreverifiedItem struct {
 	Name string
@@ -48,16 +54,17 @@ func doSort(in preverified) Preverified {
 }
 
 var (
-	MainnetChainSnapshotCfg    = newCfg(Mainnet)
-	GoerliChainSnapshotCfg     = newCfg(Goerli)
-	BscChainSnapshotCfg        = newCfg(Bsc)
-	RopstenChainSnapshotCfg    = newCfg(Ropsten)
-	MumbaiChainSnapshotCfg     = newCfg(Mumbai)
-	BorMainnetChainSnapshotCfg = newCfg(BorMainnet)
+	MainnetChainSnapshotCfg    = newCfg(Mainnet, MainnetHistory)
+	SepoliaChainSnapshotCfg    = newCfg(Sepolia, SepoliaHistory)
+	GoerliChainSnapshotCfg     = newCfg(Goerli, GoerliHistory)
+	MumbaiChainSnapshotCfg     = newCfg(Mumbai, MumbaiHistory)
+	BorMainnetChainSnapshotCfg = newCfg(BorMainnet, BorMainnetHistory)
+	GnosisChainSnapshotCfg     = newCfg(Gnosis, GnosisHistory)
+	ChiadoChainSnapshotCfg     = newCfg(Chiado, ChiadoHistory)
 )
 
-func newCfg(preverified Preverified) *Cfg {
-	return &Cfg{ExpectBlocks: maxBlockNum(preverified), Preverified: preverified}
+func newCfg(preverified, preverifiedHistory Preverified) *Cfg {
+	return &Cfg{ExpectBlocks: maxBlockNum(preverified), Preverified: preverified, PreverifiedHistory: preverifiedHistory}
 }
 
 func maxBlockNum(preverified Preverified) uint64 {
@@ -91,40 +98,62 @@ func maxBlockNum(preverified Preverified) uint64 {
 }
 
 type Cfg struct {
-	ExpectBlocks uint64
-	Preverified  Preverified
+	ExpectBlocks       uint64
+	Preverified        Preverified
+	PreverifiedHistory Preverified
 }
 
 var KnownCfgs = map[string]*Cfg{
 	networkname.MainnetChainName:    MainnetChainSnapshotCfg,
+	networkname.SepoliaChainName:    SepoliaChainSnapshotCfg,
 	networkname.GoerliChainName:     GoerliChainSnapshotCfg,
-	networkname.BSCChainName:        BscChainSnapshotCfg,
-	networkname.RopstenChainName:    RopstenChainSnapshotCfg,
 	networkname.MumbaiChainName:     MumbaiChainSnapshotCfg,
 	networkname.BorMainnetChainName: BorMainnetChainSnapshotCfg,
+	networkname.GnosisChainName:     GnosisChainSnapshotCfg,
+	networkname.ChiadoChainName:     ChiadoChainSnapshotCfg,
 }
 
 // KnownCfg return list of preverified hashes for given network, but apply whiteList filter if it's not empty
-func KnownCfg(networkName string, whiteList []string) *Cfg {
+func KnownCfg(networkName string, whiteList, whiteListHistory []string) *Cfg {
 	c, ok := KnownCfgs[networkName]
 	if !ok {
-		return newCfg(Preverified{})
+		return newCfg(Preverified{}, Preverified{})
 	}
+
+	var result, result2 Preverified
 	if len(whiteList) == 0 {
-		return c
-	}
-
-	wlMap := make(map[string]struct{}, len(whiteList))
-	for _, fName := range whiteList {
-		wlMap[fName] = struct{}{}
-	}
-
-	result := make(Preverified, 0, len(c.Preverified))
-	for _, p := range c.Preverified {
-		if _, ok := wlMap[p.Name]; !ok {
-			continue
+		result = c.Preverified
+	} else {
+		wlMap := make(map[string]struct{}, len(whiteList))
+		for _, fName := range whiteList {
+			wlMap[fName] = struct{}{}
 		}
-		result = append(result, p)
+
+		result = make(Preverified, 0, len(c.Preverified))
+		for _, p := range c.Preverified {
+			if _, ok := wlMap[p.Name]; !ok {
+				continue
+			}
+			result = append(result, p)
+		}
 	}
-	return newCfg(result)
+
+	if len(whiteList) == 0 {
+		result2 = c.PreverifiedHistory
+	} else {
+		wlMap2 := make(map[string]struct{}, len(whiteListHistory))
+		for _, fName := range whiteListHistory {
+			wlMap2[filepath.Join("history", fName)] = struct{}{}
+		}
+
+		result2 = make(Preverified, 0, len(c.PreverifiedHistory))
+		for _, p := range c.PreverifiedHistory {
+			if _, ok := wlMap2[p.Name]; !ok {
+				continue
+			}
+			result2 = append(result2, p)
+		}
+	}
+
+	return newCfg(result, result2)
 }

@@ -3,18 +3,22 @@ package trie
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math/bits"
 	"time"
 
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/common/length"
+	length2 "github.com/ledgerwatch/erigon-lib/common/length"
 	"github.com/ledgerwatch/erigon-lib/kv"
+	"github.com/ledgerwatch/log/v3"
+
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/dbutils"
 	"github.com/ledgerwatch/erigon/common/hexutil"
 	"github.com/ledgerwatch/erigon/core/types/accounts"
 	"github.com/ledgerwatch/erigon/turbo/rlphacks"
-	"github.com/ledgerwatch/log/v3"
 )
 
 /*
@@ -70,7 +74,7 @@ Then delete this account (SELFDESTRUCT).
 // FlatDBTrieLoader reads state and intermediate trie hashes in order equal to "Preorder trie traversal"
 // (Preorder - visit Root, visit Left, visit Right)
 //
-// It produces stream of values and send this stream to `defaultReceiver`
+// It produces stream of values and send this stream to `receiver`
 // It skips storage with incorrect incarnations
 //
 // Each intermediate hash key firstly pass to RetainDecider, only if it returns "false" - such AccTrie can be used.
@@ -86,10 +90,9 @@ type FlatDBTrieLoader struct {
 	// Account item buffer
 	accountValue accounts.Account
 
-	receiver        StreamReceiver
-	defaultReceiver *RootHashAggregator
-	hc              HashCollector2
-	shc             StorageHashCollector2
+	receiver *RootHashAggregator
+	hc       HashCollector2
+	shc      StorageHashCollector2
 }
 
 // RootHashAggregator - calculates Merkle trie root hash from incoming data stream
@@ -97,16 +100,16 @@ type RootHashAggregator struct {
 	trace          bool
 	wasIH          bool
 	wasIHStorage   bool
-	root           common.Hash
+	root           libcommon.Hash
 	hc             HashCollector2
 	shc            StorageHashCollector2
 	currStorage    bytes.Buffer // Current key for the structure generation algorithm, as well as the input tape for the hash builder
 	succStorage    bytes.Buffer
 	valueStorage   []byte // Current value to be used as the value tape for the hash builder
 	hadTreeStorage bool
-	hashAccount    common.Hash  // Current value to be used as the value tape for the hash builder
-	hashStorage    common.Hash  // Current value to be used as the value tape for the hash builder
-	curr           bytes.Buffer // Current key for the structure generation algorithm, as well as the input tape for the hash builder
+	hashAccount    libcommon.Hash // Current value to be used as the value tape for the hash builder
+	hashStorage    libcommon.Hash // Current value to be used as the value tape for the hash builder
+	curr           bytes.Buffer   // Current key for the structure generation algorithm, as well as the input tape for the hash builder
 	succ           bytes.Buffer
 	currAccK       []byte
 	value          []byte // Current value to be used as the value tape for the hash builder
@@ -122,22 +125,10 @@ type RootHashAggregator struct {
 	a              accounts.Account
 	leafData       GenStructStepLeafData
 	accData        GenStructStepAccountData
-}
 
-type StreamReceiver interface {
-	Receive(
-		itemType StreamItem,
-		accountKey []byte,
-		storageKey []byte,
-		accountValue *accounts.Account,
-		storageValue []byte,
-		hash []byte,
-		hasTree bool,
-		cutoff int,
-	) error
-
-	Result() SubTries
-	Root() common.Hash
+	// Used to construct an Account proof while calculating the tree root.
+	proofRetainer *ProofRetainer
+	cutoff        bool
 }
 
 func NewRootHashAggregator() *RootHashAggregator {
@@ -146,31 +137,32 @@ func NewRootHashAggregator() *RootHashAggregator {
 	}
 }
 
-func NewFlatDBTrieLoader(logPrefix string) *FlatDBTrieLoader {
-	return &FlatDBTrieLoader{
-		logPrefix:       logPrefix,
-		defaultReceiver: NewRootHashAggregator(),
-	}
-}
-
-// Reset prepares the loader for reuse
-func (l *FlatDBTrieLoader) Reset(rd RetainDeciderWithMarker, hc HashCollector2, shc StorageHashCollector2, trace bool) error {
-	l.defaultReceiver.Reset(hc, shc, trace)
-	l.hc = hc
-	l.shc = shc
-	l.receiver = l.defaultReceiver
-	l.trace = trace
-	l.ihSeek, l.accSeek, l.storageSeek, l.kHex, l.kHexS = make([]byte, 0, 128), make([]byte, 0, 128), make([]byte, 0, 128), make([]byte, 0, 128), make([]byte, 0, 128)
-	l.rd = rd
-	if l.trace {
+func NewFlatDBTrieLoader(logPrefix string, rd RetainDeciderWithMarker, hc HashCollector2, shc StorageHashCollector2, trace bool) *FlatDBTrieLoader {
+	if trace {
 		fmt.Printf("----------\n")
 		fmt.Printf("CalcTrieRoot\n")
 	}
-	return nil
+	return &FlatDBTrieLoader{
+		logPrefix: logPrefix,
+		receiver: &RootHashAggregator{
+			hb:    NewHashBuilder(false),
+			hc:    hc,
+			shc:   shc,
+			trace: trace,
+		},
+		ihSeek:      make([]byte, 0, 128),
+		accSeek:     make([]byte, 0, 128),
+		storageSeek: make([]byte, 0, 128),
+		kHex:        make([]byte, 0, 128),
+		kHexS:       make([]byte, 0, 128),
+		rd:          rd,
+		hc:          hc,
+		shc:         shc,
+	}
 }
 
-func (l *FlatDBTrieLoader) SetStreamReceiver(receiver StreamReceiver) {
-	l.receiver = receiver
+func (l *FlatDBTrieLoader) SetProofRetainer(pr *ProofRetainer) {
+	l.receiver.proofRetainer = pr
 }
 
 // CalcTrieRoot algo:
@@ -195,7 +187,7 @@ func (l *FlatDBTrieLoader) SetStreamReceiver(receiver StreamReceiver) {
 //	   SkipAccounts:
 //			use(AccTrie)
 //		}
-func (l *FlatDBTrieLoader) CalcTrieRoot(tx kv.Tx, prefix []byte, quit <-chan struct{}) (common.Hash, error) {
+func (l *FlatDBTrieLoader) CalcTrieRoot(tx kv.Tx, quit <-chan struct{}) (libcommon.Hash, error) {
 
 	accC, err := tx.Cursor(kv.HashedAccounts)
 	if err != nil {
@@ -228,7 +220,7 @@ func (l *FlatDBTrieLoader) CalcTrieRoot(tx kv.Tx, prefix []byte, quit <-chan str
 	defer ss.Close()
 	logEvery := time.NewTicker(30 * time.Second)
 	defer logEvery.Stop()
-	for ihK, ihV, hasTree, err := accTrie.AtPrefix(prefix); ; ihK, ihV, hasTree, err = accTrie.Next() { // no loop termination is at he end of loop
+	for ihK, ihV, hasTree, err := accTrie.AtPrefix(nil); ; ihK, ihV, hasTree, err = accTrie.Next() { // no loop termination is at he end of loop
 		if err != nil {
 			return EmptyRoot, err
 		}
@@ -240,7 +232,7 @@ func (l *FlatDBTrieLoader) CalcTrieRoot(tx kv.Tx, prefix []byte, quit <-chan str
 			if err1 != nil {
 				return EmptyRoot, err1
 			}
-			if keyIsBefore(ihK, kHex) || !bytes.HasPrefix(kHex, prefix) { // read all accounts until next AccTrie
+			if keyIsBefore(ihK, kHex) || !bytes.HasPrefix(kHex, nil) { // read all accounts until next AccTrie
 				break
 			}
 			if err = l.accountValue.DecodeForStorage(v); err != nil {
@@ -307,10 +299,9 @@ func (l *FlatDBTrieLoader) CalcTrieRoot(tx kv.Tx, prefix []byte, quit <-chan str
 		}
 	}
 
-	if err := l.receiver.Receive(CutoffStreamItem, nil, nil, nil, nil, nil, false, len(prefix)); err != nil {
+	if err := l.receiver.Receive(CutoffStreamItem, nil, nil, nil, nil, nil, false, 0); err != nil {
 		return EmptyRoot, err
 	}
-
 	return l.receiver.Root(), nil
 }
 
@@ -326,27 +317,6 @@ func (l *FlatDBTrieLoader) logProgress(accountKey, ihK []byte) {
 
 func (r *RootHashAggregator) RetainNothing(_ []byte) bool {
 	return false
-}
-
-func (r *RootHashAggregator) Reset(hc HashCollector2, shc StorageHashCollector2, trace bool) {
-	r.hc = hc
-	r.shc = shc
-	r.curr.Reset()
-	r.succ.Reset()
-	r.value = nil
-	r.groups = r.groups[:0]
-	r.hasTree = r.hasTree[:0]
-	r.hasHash = r.hasHash[:0]
-	r.a.Reset()
-	r.hb.Reset()
-	r.wasIH = false
-	r.currStorage.Reset()
-	r.succStorage.Reset()
-	r.valueStorage = nil
-	r.wasIHStorage = false
-	r.root = common.Hash{}
-	r.trace = trace
-	r.hb.trace = trace
 }
 
 func (r *RootHashAggregator) Receive(itemType StreamItem,
@@ -369,6 +339,7 @@ func (r *RootHashAggregator) Receive(itemType StreamItem,
 	//	fmt.Printf("1: %d, %x, %x, %x\n", itemType, accountKey, storageKey, hash)
 	//	//}
 	//}
+	//
 
 	switch itemType {
 	case StorageStreamItem:
@@ -384,7 +355,7 @@ func (r *RootHashAggregator) Receive(itemType StreamItem,
 		r.saveValueStorage(false, hasTree, storageValue, hash)
 	case SHashStreamItem:
 		if len(storageKey) == 0 { // this is ready-to-use storage root - no reason to call GenStructStep, also GenStructStep doesn't support empty prefixes
-			r.hb.hashStack = append(append(r.hb.hashStack, byte(80+common.HashLength)), hash...)
+			r.hb.hashStack = append(append(r.hb.hashStack, byte(80+length2.Hash)), hash...)
 			r.hb.nodeStack = append(r.hb.nodeStack, nil)
 			r.accData.FieldSet |= AccountFieldStorageOnly
 			break
@@ -480,6 +451,10 @@ func (r *RootHashAggregator) Receive(itemType StreamItem,
 				r.accData.FieldSet |= AccountFieldStorageOnly
 			}
 		}
+
+		// Used for optional GetProof calculation to trigger inclusion of the top-level node
+		r.cutoff = true
+
 		if r.curr.Len() > 0 {
 			if err := r.genStructAccount(); err != nil {
 				return err
@@ -523,11 +498,7 @@ func (r *RootHashAggregator) Receive(itemType StreamItem,
 // 	}
 // }
 
-func (r *RootHashAggregator) Result() SubTries {
-	panic("don't call me")
-}
-
-func (r *RootHashAggregator) Root() common.Hash {
+func (r *RootHashAggregator) Root() libcommon.Hash {
 	return r.root
 }
 
@@ -564,13 +535,32 @@ func (r *RootHashAggregator) genStructStorage() error {
 		r.leafData.Value = rlphacks.RlpSerializableBytes(r.valueStorage)
 		data = &r.leafData
 	}
-	r.groupsStorage, r.hasTreeStorage, r.hasHashStorage, err = GenStructStep(r.RetainNothing, r.currStorage.Bytes(), r.succStorage.Bytes(), r.hb, func(keyHex []byte, hasState, hasTree, hasHash uint16, hashes, rootHash []byte) error {
+	var wantProof func(_ []byte) *proofElement
+	if r.proofRetainer != nil {
+		var fullKey [2 * (length.Hash + length.Incarnation + length.Hash)]byte
+		for i, b := range r.currAccK {
+			fullKey[i*2] = b / 16
+			fullKey[i*2+1] = b % 16
+		}
+		for i, b := range binary.BigEndian.AppendUint64(nil, r.a.Incarnation) {
+			fullKey[2*length.Hash+i*2] = b / 16
+			fullKey[2*length.Hash+i*2+1] = b % 16
+		}
+		baseKeyLen := 2 * (length.Hash + length.Incarnation)
+		wantProof = func(prefix []byte) *proofElement {
+			copy(fullKey[baseKeyLen:], prefix)
+			return r.proofRetainer.ProofElement(fullKey[:baseKeyLen+len(prefix)])
+		}
+	}
+	r.groupsStorage, r.hasTreeStorage, r.hasHashStorage, err = GenStructStepEx(r.RetainNothing, r.currStorage.Bytes(), r.succStorage.Bytes(), r.hb, func(keyHex []byte, hasState, hasTree, hasHash uint16, hashes, rootHash []byte) error {
 		if r.shc == nil {
 			return nil
 		}
 		return r.shc(r.currAccK, keyHex, hasState, hasTree, hasHash, hashes, rootHash)
 	}, data, r.groupsStorage, r.hasTreeStorage, r.hasHashStorage,
 		r.trace,
+		wantProof,
+		r.cutoff,
 	)
 	if err != nil {
 		return err
@@ -632,14 +622,21 @@ func (r *RootHashAggregator) genStructAccount() error {
 	r.currStorage.Reset()
 	r.succStorage.Reset()
 	var err error
-	if r.groups, r.hasTree, r.hasHash, err = GenStructStep(r.RetainNothing, r.curr.Bytes(), r.succ.Bytes(), r.hb, func(keyHex []byte, hasState, hasTree, hasHash uint16, hashes, rootHash []byte) error {
+
+	var wantProof func(_ []byte) *proofElement
+	if r.proofRetainer != nil {
+		wantProof = r.proofRetainer.ProofElement
+	}
+	if r.groups, r.hasTree, r.hasHash, err = GenStructStepEx(r.RetainNothing, r.curr.Bytes(), r.succ.Bytes(), r.hb, func(keyHex []byte, hasState, hasTree, hasHash uint16, hashes, rootHash []byte) error {
 		if r.hc == nil {
 			return nil
 		}
 		return r.hc(keyHex, hasState, hasTree, hasHash, hashes, rootHash)
 	}, data, r.groups, r.hasTree, r.hasHash,
-		false,
-		//r.trace,
+		//false,
+		r.trace,
+		wantProof,
+		r.cutoff,
 	); err != nil {
 		return err
 	}
@@ -737,7 +734,7 @@ func (c *AccTrieCursor) FirstNotCoveredPrefix() []byte {
 }
 
 func (c *AccTrieCursor) AtPrefix(prefix []byte) (k, v []byte, hasTree bool, err error) {
-	c.SkipState = true
+	c.SkipState = false // There can be accounts with keys less than the first key in AccTrie
 	_, c.nextCreated = c.canUse([]byte{})
 	c.prev = append(c.prev[:0], c.cur...)
 	c.prefix = prefix
@@ -921,7 +918,7 @@ func (c *AccTrieCursor) _hasState() bool { return (1<<c.childID[c.lvl])&c.hasSta
 func (c *AccTrieCursor) _hasTree() bool  { return (1<<c.childID[c.lvl])&c.hasTree[c.lvl] != 0 }
 func (c *AccTrieCursor) _hasHash() bool  { return (1<<c.childID[c.lvl])&c.hasHash[c.lvl] != 0 }
 func (c *AccTrieCursor) _hash(i int8) []byte {
-	return c.v[c.lvl][common.HashLength*int(i) : common.HashLength*(int(i)+1)]
+	return c.v[c.lvl][length2.Hash*int(i) : length2.Hash*(int(i)+1)]
 }
 
 func (c *AccTrieCursor) _consume() (bool, error) {
@@ -1190,7 +1187,7 @@ func (c *StorageTrieCursor) _hasState() bool { return (1<<c.childID[c.lvl])&c.ha
 func (c *StorageTrieCursor) _hasHash() bool  { return (1<<c.childID[c.lvl])&c.hasHash[c.lvl] != 0 }
 func (c *StorageTrieCursor) _hasTree() bool  { return (1<<c.childID[c.lvl])&c.hasTree[c.lvl] != 0 }
 func (c *StorageTrieCursor) _hash(i int8) []byte {
-	return c.v[c.lvl][int(i)*common.HashLength : (int(i)+1)*common.HashLength]
+	return c.v[c.lvl][int(i)*length2.Hash : (int(i)+1)*length2.Hash]
 }
 
 func (c *StorageTrieCursor) _nextSiblingInMem() bool {
@@ -1416,36 +1413,36 @@ func keyIsBefore(k1, k2 []byte) bool {
 	return bytes.Compare(k1, k2) < 0
 }
 
-func UnmarshalTrieNodeTyped(v []byte) (hasState, hasTree, hasHash uint16, hashes []common.Hash, rootHash common.Hash) {
+func UnmarshalTrieNodeTyped(v []byte) (hasState, hasTree, hasHash uint16, hashes []libcommon.Hash, rootHash libcommon.Hash) {
 	hasState, hasTree, hasHash, v = binary.BigEndian.Uint16(v), binary.BigEndian.Uint16(v[2:]), binary.BigEndian.Uint16(v[4:]), v[6:]
-	if bits.OnesCount16(hasHash)+1 == len(v)/common.HashLength {
+	if bits.OnesCount16(hasHash)+1 == len(v)/length2.Hash {
 		rootHash.SetBytes(common.CopyBytes(v[:32]))
 		v = v[32:]
 	}
-	hashes = make([]common.Hash, len(v)/common.HashLength)
+	hashes = make([]libcommon.Hash, len(v)/length2.Hash)
 	for i := 0; i < len(hashes); i++ {
-		hashes[i].SetBytes(common.CopyBytes(v[i*common.HashLength : (i+1)*common.HashLength]))
+		hashes[i].SetBytes(common.CopyBytes(v[i*length2.Hash : (i+1)*length2.Hash]))
 	}
 	return
 }
 
 func UnmarshalTrieNode(v []byte) (hasState, hasTree, hasHash uint16, hashes, rootHash []byte) {
 	hasState, hasTree, hasHash, hashes = binary.BigEndian.Uint16(v), binary.BigEndian.Uint16(v[2:]), binary.BigEndian.Uint16(v[4:]), v[6:]
-	if bits.OnesCount16(hasHash)+1 == len(hashes)/common.HashLength {
+	if bits.OnesCount16(hasHash)+1 == len(hashes)/length2.Hash {
 		rootHash = hashes[:32]
 		hashes = hashes[32:]
 	}
 	return
 }
 
-func MarshalTrieNodeTyped(hasState, hasTree, hasHash uint16, h []common.Hash, buf []byte) []byte {
-	buf = buf[:6+len(h)*common.HashLength]
+func MarshalTrieNodeTyped(hasState, hasTree, hasHash uint16, h []libcommon.Hash, buf []byte) []byte {
+	buf = buf[:6+len(h)*length2.Hash]
 	meta, hashes := buf[:6], buf[6:]
 	binary.BigEndian.PutUint16(meta, hasState)
 	binary.BigEndian.PutUint16(meta[2:], hasTree)
 	binary.BigEndian.PutUint16(meta[4:], hasHash)
 	for i := 0; i < len(h); i++ {
-		copy(hashes[i*common.HashLength:(i+1)*common.HashLength], h[i].Bytes())
+		copy(hashes[i*length2.Hash:(i+1)*length2.Hash], h[i].Bytes())
 	}
 	return buf
 }
@@ -1469,15 +1466,15 @@ func MarshalTrieNode(hasState, hasTree, hasHash uint16, hashes, rootHash []byte,
 	return buf
 }
 
-func CastTrieNodeValue(hashes, rootHash []byte) []common.Hash {
-	to := make([]common.Hash, len(hashes)/common.HashLength+len(rootHash)/common.HashLength)
+func CastTrieNodeValue(hashes, rootHash []byte) []libcommon.Hash {
+	to := make([]libcommon.Hash, len(hashes)/length2.Hash+len(rootHash)/length2.Hash)
 	i := 0
 	if len(rootHash) > 0 {
 		to[0].SetBytes(common.CopyBytes(rootHash))
 		i++
 	}
-	for j := 0; j < len(hashes)/common.HashLength; j++ {
-		to[i].SetBytes(common.CopyBytes(hashes[j*common.HashLength : (j+1)*common.HashLength]))
+	for j := 0; j < len(hashes)/length2.Hash; j++ {
+		to[i].SetBytes(common.CopyBytes(hashes[j*length2.Hash : (j+1)*length2.Hash]))
 		i++
 	}
 	return to
@@ -1485,13 +1482,10 @@ func CastTrieNodeValue(hashes, rootHash []byte) []common.Hash {
 
 // CalcRoot is a combination of `ResolveStateTrie` and `UpdateStateTrie`
 // DESCRIBED: docs/programmers_guide/guide.md#organising-ethereum-state-into-a-merkle-tree
-func CalcRoot(logPrefix string, tx kv.Tx) (common.Hash, error) {
-	loader := NewFlatDBTrieLoader(logPrefix)
-	if err := loader.Reset(NewRetainList(0), nil, nil, false); err != nil {
-		return EmptyRoot, err
-	}
+func CalcRoot(logPrefix string, tx kv.Tx) (libcommon.Hash, error) {
+	loader := NewFlatDBTrieLoader(logPrefix, NewRetainList(0), nil, nil, false)
 
-	h, err := loader.CalcTrieRoot(tx, nil, nil)
+	h, err := loader.CalcTrieRoot(tx, nil)
 	if err != nil {
 		return EmptyRoot, err
 	}
@@ -1504,9 +1498,9 @@ func makeCurrentKeyStr(k []byte) string {
 	if k == nil {
 		currentKeyStr = "final"
 	} else if len(k) < 4 {
-		currentKeyStr = fmt.Sprintf("%x", k)
+		currentKeyStr = hex.EncodeToString(k)
 	} else {
-		currentKeyStr = fmt.Sprintf("%x...", k[:4])
+		currentKeyStr = hex.EncodeToString(k[:4])
 	}
 	return currentKeyStr
 }

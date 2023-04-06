@@ -7,9 +7,11 @@ import (
 	"sync"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
+	"github.com/google/btree"
+	"github.com/hashicorp/golang-lru/v2"
+	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/etl"
-	"github.com/ledgerwatch/erigon/common"
+
 	"github.com/ledgerwatch/erigon/consensus"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/rlp"
@@ -87,6 +89,7 @@ func (lq *LinkQueue) Pop() interface{} {
 	old := *lq
 	n := len(old)
 	x := old[n-1]
+	old[n-1] = nil
 	x.idx = -1
 	x.queueId = NoQueue
 	*lq = old[0 : n-1]
@@ -107,54 +110,6 @@ type Anchor struct {
 	blockHeight   uint64
 	nextRetryTime time.Time // Zero when anchor has just been created, otherwise time when anchor needs to be check to see if retry is needed
 	timeouts      int       // Number of timeout that this anchor has experiences - after certain threshold, it gets invalidated
-	idx           int       // Index of the anchor in the queue to be able to modify specific items
-}
-
-// AnchorQueue is a priority queue of anchors that priorises by the time when
-// another retry on the extending the anchor needs to be attempted
-// Every time anchor's extension is requested, the `nextRetryTime` is reset
-// to 5 seconds in the future, and when it expires, and the anchor is still
-// retry is made
-// It implement heap.Interface to be useable by the standard library `heap`
-// as a priority queue (implemented as a binary heap)
-// As anchors are moved around in the binary heap, they internally track their
-// position in the heap (using `idx` field). This feature allows updating
-// the heap (using `Fix` function) in situations when anchor is accessed not
-// through the priority queue, but through the map `anchor` in the
-// HeaderDownloader type.
-type AnchorQueue []*Anchor
-
-func (aq AnchorQueue) Len() int {
-	return len(aq)
-}
-
-func (aq AnchorQueue) Less(i, j int) bool {
-	if aq[i].nextRetryTime == aq[j].nextRetryTime {
-		// When next retry times are the same, we prioritise low block height anchors
-		return aq[i].blockHeight < aq[j].blockHeight
-	}
-	return aq[i].nextRetryTime.Before(aq[j].nextRetryTime)
-}
-
-func (aq AnchorQueue) Swap(i, j int) {
-	aq[i], aq[j] = aq[j], aq[i]
-	aq[i].idx, aq[j].idx = i, j // Restore indices after the swap
-}
-
-func (aq *AnchorQueue) Push(x interface{}) {
-	// Push and Pop use pointer receivers because they modify the slice's length,
-	// not just its contents.
-	x.(*Anchor).idx = len(*aq)
-	*aq = append(*aq, x.(*Anchor))
-}
-
-func (aq *AnchorQueue) Pop() interface{} {
-	old := *aq
-	n := len(old)
-	x := old[n-1]
-	*aq = old[0 : n-1]
-	x.idx = -1
-	return x
 }
 
 type ChainSegmentHeader struct {
@@ -243,6 +198,7 @@ func (iq *InsertQueue) Pop() interface{} {
 	old := *iq
 	n := len(old)
 	x := old[n-1]
+	old[n-1] = nil
 	*iq = old[0 : n-1]
 	x.idx = -1
 	x.queueId = NoQueue
@@ -275,11 +231,11 @@ type HeaderDownload struct {
 	anchors                map[common.Hash]*Anchor // Mapping from parentHash to collection of anchors
 	links                  map[common.Hash]*Link   // Links by header hash
 	engine                 consensus.Engine
-	insertQueue            InsertQueue    // Priority queue of non-persisted links that need to be verified and can be inserted
-	seenAnnounces          *SeenAnnounces // External announcement hashes, after header verification if hash is in this set - will broadcast it further
-	persistedLinkQueue     LinkQueue      // Priority queue of persisted links used to limit their number
-	linkQueue              LinkQueue      // Priority queue of non-persisted links used to limit their number
-	anchorQueue            *AnchorQueue   // Priority queue of anchors used to sequence the header requests
+	insertQueue            InsertQueue            // Priority queue of non-persisted links that need to be verified and can be inserted
+	seenAnnounces          *SeenAnnounces         // External announcement hashes, after header verification if hash is in this set - will broadcast it further
+	persistedLinkQueue     LinkQueue              // Priority queue of persisted links used to limit their number
+	linkQueue              LinkQueue              // Priority queue of non-persisted links used to limit their number
+	anchorTree             *btree.BTreeG[*Anchor] // anchors sorted by block height
 	DeliveryNotify         chan struct{}
 	toAnnounce             []Announce
 	lock                   sync.RWMutex
@@ -288,9 +244,8 @@ type HeaderDownload struct {
 	persistedLinkLimit     int    // Maximum allowed number of persisted links
 	anchorLimit            int    // Maximum allowed number of anchors
 	highestInDb            uint64 // Height of the highest block header in the database
-	requestChaining        bool   // Whether the downloader is allowed to issue more requests when previous responses created or moved an anchor
+	initialCycle           bool   // Whether downloader is used in the initial cycle, and is allowed to issue more requests when previous responses created or moved an anchor
 	fetchingNew            bool   // Set when the stage that is actively fetching the headers is in progress
-	topSeenHeightPoW       uint64
 	latestMinedBlockNumber uint64
 	QuitPoWMining          chan struct{}
 	trace                  bool
@@ -300,7 +255,6 @@ type HeaderDownload struct {
 	headerReader          services.HeaderReader
 
 	// Proof of Stake (PoS)
-	topSeenHeightPoS     uint64
 	firstSeenHeightPoS   *uint64
 	requestId            int
 	posAnchor            *Anchor
@@ -309,6 +263,7 @@ type HeaderDownload struct {
 	headersCollector     *etl.Collector               // ETL collector for headers
 	BeaconRequestList    *engineapi.RequestList       // Requests from ethbackend to staged sync
 	PayloadStatusCh      chan engineapi.PayloadStatus // Responses (validation/execution status)
+	ShutdownCh           chan struct{}                // Channel to signal shutdown
 	pendingPayloadHash   common.Hash                  // Header whose status we still should send to PayloadStatusCh
 	pendingPayloadStatus *engineapi.PayloadStatus     // Alternatively, there can be an already prepared response to send to PayloadStatusCh
 	unsettledForkChoice  *engineapi.ForkChoiceMessage // Forkchoice to process after unwind
@@ -331,6 +286,7 @@ func NewHeaderDownload(
 ) *HeaderDownload {
 	persistentLinkLimit := linkLimit / 16
 	hd := &HeaderDownload{
+		initialCycle:       true,
 		badHeaders:         make(map[common.Hash]struct{}),
 		anchors:            make(map[common.Hash]*Anchor),
 		persistedLinkLimit: persistentLinkLimit,
@@ -338,18 +294,18 @@ func NewHeaderDownload(
 		anchorLimit:        anchorLimit,
 		engine:             engine,
 		links:              make(map[common.Hash]*Link),
-		anchorQueue:        &AnchorQueue{},
+		anchorTree:         btree.NewG[*Anchor](32, func(a, b *Anchor) bool { return a.blockHeight < b.blockHeight }),
 		seenAnnounces:      NewSeenAnnounces(),
 		DeliveryNotify:     make(chan struct{}, 1),
 		QuitPoWMining:      make(chan struct{}),
 		BeaconRequestList:  engineapi.NewRequestList(),
 		PayloadStatusCh:    make(chan engineapi.PayloadStatus, 1),
+		ShutdownCh:         make(chan struct{}),
 		headerReader:       headerReader,
 		badPoSHeaders:      make(map[common.Hash]common.Hash),
 	}
 	heap.Init(&hd.persistedLinkQueue)
 	heap.Init(&hd.linkQueue)
-	heap.Init(hd.anchorQueue)
 	heap.Init(&hd.insertQueue)
 	return hd
 }
@@ -422,7 +378,7 @@ type HeaderInserter struct {
 	unwindPoint      uint64
 	highest          uint64
 	highestTimestamp uint64
-	canonicalCache   *lru.Cache
+	canonicalCache   *lru.Cache[uint64, common.Hash]
 	headerReader     services.HeaderAndCanonicalReader
 }
 
@@ -433,17 +389,17 @@ func NewHeaderInserter(logPrefix string, localTd *big.Int, headerProgress uint64
 		unwindPoint:  headerProgress,
 		headerReader: headerReader,
 	}
-	hi.canonicalCache, _ = lru.New(1000)
+	hi.canonicalCache, _ = lru.New[uint64, common.Hash](1000)
 	return hi
 }
 
 // SeenAnnounces - external announcement hashes, after header verification if hash is in this set - will broadcast it further
 type SeenAnnounces struct {
-	hashes *lru.Cache
+	hashes *lru.Cache[common.Hash, struct{}]
 }
 
 func NewSeenAnnounces() *SeenAnnounces {
-	cache, err := lru.New(1000)
+	cache, err := lru.New[common.Hash, struct{}](1000)
 	if err != nil {
 		panic("error creating prefetching cache for blocks")
 	}

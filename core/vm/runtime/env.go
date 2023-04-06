@@ -19,26 +19,25 @@ package runtime
 import (
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/vm"
-	"github.com/ledgerwatch/erigon/ethdb"
+	"github.com/ledgerwatch/erigon/core/vm/evmtypes"
 )
 
 func NewEnv(cfg *Config) *vm.EVM {
-	txContext := vm.TxContext{
+	txContext := evmtypes.TxContext{
 		Origin:   cfg.Origin,
 		GasPrice: cfg.GasPrice,
 	}
 
-	blockContext := vm.BlockContext{
-		CanTransfer:     core.CanTransfer,
-		Transfer:        core.Transfer,
-		GetHash:         cfg.GetHashFn,
-		ContractHasTEVM: ethdb.GetHasTEVM(cfg.kv),
-		Coinbase:        cfg.Coinbase,
-		BlockNumber:     cfg.BlockNumber.Uint64(),
-		Time:            cfg.Time.Uint64(),
-		Difficulty:      cfg.Difficulty,
-		GasLimit:        cfg.GasLimit,
-		BaseFee:         cfg.BaseFee,
+	blockContext := evmtypes.BlockContext{
+		CanTransfer: core.CanTransfer,
+		Transfer:    core.Transfer,
+		GetHash:     cfg.GetHashFn,
+		Coinbase:    cfg.Coinbase,
+		BlockNumber: cfg.BlockNumber.Uint64(),
+		Time:        cfg.Time.Uint64(),
+		Difficulty:  cfg.Difficulty,
+		GasLimit:    cfg.GasLimit,
+		BaseFee:     cfg.BaseFee,
 	}
 
 	return vm.NewEVM(blockContext, txContext, cfg.State, cfg.ChainConfig, cfg.EVMConfig)

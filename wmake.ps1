@@ -20,9 +20,8 @@ Param(
     [Alias("target")]
     [ValidateSet(
         "clean",
-        "cons",
         "db-tools",
-        "devnettest",
+        "devnet",
         "downloader",
         "erigon",
         "evm",
@@ -70,8 +69,7 @@ if ($BuildTargets.Count -gt 1) {
 
 if ($BuildTargets[0] -eq "all") {
     $BuildTargets = @(
-        "cons",
-        "devnettest",
+        "devnet",
         "downloader",
         "erigon",
         "evm",
@@ -407,7 +405,7 @@ if (!Test-Path -Path [string](Join-Path $MyContext.Directory "\.git") -PathType 
 if(!(Test-Git-Installed)) { exit 1 }
     
 ## Test GO language is installed AND min version
-if(!(Test-GO-Installed "1.18")) { exit 1 }
+if(!(Test-GO-Installed "1.19")) { exit 1 }
 
 # Build erigon binaries
 Set-Variable -Name "Erigon" -Value ([hashtable]::Synchronized(@{})) -Scope Script
@@ -415,7 +413,7 @@ $Erigon.Commit     = [string]@(git.exe rev-list -1 HEAD)
 $Erigon.Branch     = [string]@(git.exe rev-parse --abbrev-ref HEAD)
 $Erigon.Tag        = [string]@(git.exe describe --tags)
 
-$Erigon.BuildTags = "nosqlite,noboltdb"
+$Erigon.BuildTags = "nosqlite,noboltdb,netgo"
 $Erigon.Package = "github.com/ledgerwatch/erigon"
 
 $Erigon.BuildFlags = "-trimpath -tags $($Erigon.BuildTags) -buildvcs=false -v"
@@ -423,6 +421,7 @@ $Erigon.BuildFlags += " -ldflags ""-X $($Erigon.Package)/params.GitCommit=$($Eri
 
 $Erigon.BinPath    = [string](Join-Path $MyContext.StartDir "\build\bin")
 $env:GO111MODULE = "on"
+$env:CGO_CFLAGS = "-g -O2 -D__BLST_PORTABLE__"
 
 New-Item -Path $Erigon.BinPath -ItemType Directory -Force | Out-Null
 if(!$?) {
@@ -487,6 +486,7 @@ if ($BuildTarget -eq "db-tools") {
     -D MDBX_WITHOUT_MSVC_CRT:BOOOL=OFF `
     -D MDBX_BUILD_TIMESTAMP=unknown `
     -D MDBX_FORCE_ASSERTIONS:INT=0
+    -D __BLST_PORTABLE__
     if($LASTEXITCODE) {
         Write-Host "An error has occurred while configuring MDBX"
         exit $LASTEXITCODE

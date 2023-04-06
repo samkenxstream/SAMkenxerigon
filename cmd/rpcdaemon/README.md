@@ -236,12 +236,14 @@ The following table shows the current implementation status of Erigon's RPC daem
 | eth_getTransactionCount                    | Yes     |                                      |
 | eth_getStorageAt                           | Yes     |                                      |
 | eth_call                                   | Yes     |                                      |
+| eth_callMany                               | Yes     | Erigon Method PR#4567                |
 | eth_callBundle                             | Yes     |                                      |
 | eth_createAccessList                       | Yes     |                                      |
 |                                            |         |                                      |
 | eth_newFilter                              | Yes     | Added by PR#4253                     |
 | eth_newBlockFilter                         | Yes     |                                      |
 | eth_newPendingTransactionFilter            | Yes     |                                      |
+| eth_getFilterLogs                          | Yes     | Added by PR#6514                     |
 | eth_getFilterChanges                       | Yes     |                                      |
 | eth_uninstallFilter                        | Yes     |                                      |
 | eth_getLogs                                | Yes     |                                      |
@@ -253,7 +255,7 @@ The following table shows the current implementation status of Erigon's RPC daem
 | eth_signTransaction                        | -       | not yet implemented                  |
 | eth_signTypedData                          | -       | ????                                 |
 |                                            |         |                                      |
-| eth_getProof                               | -       | not yet implemented                  |
+| eth_getProof                               | Yes     | Limited to last 1000 blocks          |
 |                                            |         |                                      |
 | eth_mining                                 | Yes     | returns true if --mine flag provided |
 | eth_coinbase                               | Yes     |                                      |
@@ -263,13 +265,18 @@ The following table shows the current implementation status of Erigon's RPC daem
 | eth_submitWork                             | Yes     |                                      |
 |                                            |         |                                      |
 | eth_subscribe                              | Limited | Websock Only - newHeads,             |
+|                                            |         | newPendingTransactionsWithBody,      |
 |                                            |         | newPendingTransactions,              |
 |                                            |         | newPendingBlock                      |
+|                                            |         | logs                                 |
 | eth_unsubscribe                            | Yes     | Websock Only                         |
 |                                            |         |                                      |
 | engine_newPayloadV1                        | Yes     |                                      |
+| engine_newPayloadV2                        | Yes     |                                      |
 | engine_forkchoiceUpdatedV1                 | Yes     |                                      |
+| engine_forkchoiceUpdatedV2                 | Yes     |                                      |
 | engine_getPayloadV1                        | Yes     |                                      |
+| engine_getPayloadV2                        | Yes     |                                      |
 | engine_exchangeTransitionConfigurationV1   | Yes     |                                      |
 |                                            |         |                                      |
 | debug_accountRange                         | Yes     | Private Erigon debug module          |
@@ -281,6 +288,7 @@ The following table shows the current implementation status of Erigon's RPC daem
 | debug_traceBlockByNumber                   | Yes     | Streaming (can handle huge results)  |
 | debug_traceTransaction                     | Yes     | Streaming (can handle huge results)  |
 | debug_traceCall                            | Yes     | Streaming (can handle huge results)  |
+| debug_traceCallMany                        | Yes     | Erigon Method PR#4567.               |
 |                                            |         |                                      |
 | trace_call                                 | Yes     |                                      |
 | trace_callMany                             | Yes     |                                      |
@@ -306,13 +314,13 @@ The following table shows the current implementation status of Erigon's RPC daem
 | db_getHex                                  | No      | deprecated                           |
 |                                            |         |                                      |
 | erigon_getHeaderByHash                     | Yes     | Erigon only                          |
+| erigon_getBlockReceiptsByBlockHash         | Yes     | Erigon only                          |
 | erigon_getHeaderByNumber                   | Yes     | Erigon only                          |
 | erigon_getLogsByHash                       | Yes     | Erigon only                          |
 | erigon_forks                               | Yes     | Erigon only                          |
-| erigon_issuance                            | Yes     | Erigon only                          |
-| erigon_GetBlockByTimestamp                 | Yes     | Erigon only                          |
-|                                            |         |                                      |
-| starknet_call                              | Yes     | Starknet only                        |
+| erigon_getBlockByTimestamp                 | Yes     | Erigon only                          |
+| erigon_BlockNumber                         | Yes     | Erigon only                          |
+| erigon_getLatestLogs                       | Yes     | Erigon only                          |
 |                                            |         |                                      |
 | bor_getSnapshot                            | Yes     | Bor only                             |
 | bor_getAuthor                              | Yes     | Bor only                             |
@@ -322,6 +330,13 @@ The following table shows the current implementation status of Erigon's RPC daem
 | bor_getCurrentProposer                     | Yes     | Bor only                             |
 | bor_getCurrentValidators                   | Yes     | Bor only                             |
 | bor_getRootHash                            | Yes     | Bor only                             |
+
+### GraphQL
+
+| Command                                    | Avail   | Notes                                |
+|--------------------------------------------|---------|--------------------------------------|
+| GetBlockDetails                            | Yes     |                                      |
+| GetChainID                                 | Yes     |                                      |
 
 This table is constantly updated. Please visit again.
 

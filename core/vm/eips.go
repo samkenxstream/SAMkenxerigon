@@ -26,6 +26,8 @@ import (
 )
 
 var activators = map[int]func(*JumpTable){
+	3855: enable3855,
+	3860: enable3860,
 	3529: enable3529,
 	3198: enable3198,
 	2929: enable2929,
@@ -43,6 +45,7 @@ func EnableEIP(eipNum int, jt *JumpTable) error {
 		return fmt.Errorf("undefined eip %d", eipNum)
 	}
 	enablerFn(jt)
+	validateAndFillMaxStack(jt)
 	return nil
 }
 
@@ -74,8 +77,8 @@ func enable1884(jt *JumpTable) {
 	jt[SELFBALANCE] = &operation{
 		execute:     opSelfBalance,
 		constantGas: GasFastStep,
-		minStack:    minStack(0, 1),
-		maxStack:    maxStack(0, 1),
+		numPop:      0,
+		numPush:     1,
 	}
 }
 
@@ -92,8 +95,8 @@ func enable1344(jt *JumpTable) {
 	jt[CHAINID] = &operation{
 		execute:     opChainID,
 		constantGas: GasQuickStep,
-		minStack:    minStack(0, 1),
-		maxStack:    maxStack(0, 1),
+		numPop:      0,
+		numPush:     1,
 	}
 }
 
@@ -160,8 +163,8 @@ func enable3198(jt *JumpTable) {
 	jt[BASEFEE] = &operation{
 		execute:     opBaseFee,
 		constantGas: GasQuickStep,
-		minStack:    minStack(0, 1),
-		maxStack:    maxStack(0, 1),
+		numPop:      0,
+		numPush:     1,
 	}
 }
 
@@ -169,5 +172,52 @@ func enable3198(jt *JumpTable) {
 func opBaseFee(pc *uint64, interpreter *EVMInterpreter, callContext *ScopeContext) ([]byte, error) {
 	baseFee := interpreter.evm.Context().BaseFee
 	callContext.Stack.Push(baseFee)
+	return nil, nil
+}
+
+// enable3855 applies EIP-3855 (PUSH0 opcode)
+func enable3855(jt *JumpTable) {
+	// New opcode
+	jt[PUSH0] = &operation{
+		execute:     opPush0,
+		constantGas: GasQuickStep,
+		numPop:      0,
+		numPush:     1,
+	}
+}
+
+// opPush0 implements the PUSH0 opcode
+func opPush0(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
+	scope.Stack.Push(new(uint256.Int))
+	return nil, nil
+}
+
+// EIP-3860: Limit and meter initcode
+// https://eips.ethereum.org/EIPS/eip-3860
+func enable3860(jt *JumpTable) {
+	jt[CREATE].dynamicGas = gasCreateEip3860
+	jt[CREATE2].dynamicGas = gasCreate2Eip3860
+}
+
+// enableSharding applies mini-danksharding (DATAHASH Opcode)
+// - Adds an opcode that returns the versioned data hash of the tx at a index.
+func enableSharding(jt *JumpTable) {
+	jt[DATAHASH] = &operation{
+		execute:     opDataHash,
+		constantGas: GasFastestStep,
+		numPop:      0,
+		numPush:     1,
+	}
+}
+
+// opDataHash implements DATAHASH opcode
+func opDataHash(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
+	idx := scope.Stack.Peek()
+	if idx.LtUint64(uint64(len(interpreter.evm.TxContext().DataHashes))) {
+		hash := interpreter.evm.TxContext().DataHashes[idx.Uint64()]
+		idx.SetBytes(hash.Bytes())
+	} else {
+		idx.Clear()
+	}
 	return nil, nil
 }

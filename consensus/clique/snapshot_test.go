@@ -18,18 +18,21 @@ package clique_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"sort"
 	"testing"
 
+	"github.com/ledgerwatch/erigon-lib/chain"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/common/length"
+	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/memdb"
-	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/consensus/clique"
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/crypto"
 	"github.com/ledgerwatch/erigon/eth/stagedsync"
-	"github.com/ledgerwatch/erigon/ethdb/olddb"
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/turbo/stages"
 )
@@ -50,22 +53,22 @@ func newTesterAccountPool() *testerAccountPool {
 // checkpoint creates a Clique checkpoint signer section from the provided list
 // of authorized signers and embeds it into the provided header.
 func (ap *testerAccountPool) checkpoint(header *types.Header, signers []string) {
-	auths := make([]common.Address, len(signers))
+	auths := make([]libcommon.Address, len(signers))
 	for i, signer := range signers {
 		auths[i] = ap.address(signer)
 	}
 	sort.Sort(clique.SignersAscending(auths))
 	for i, auth := range auths {
-		copy(header.Extra[clique.ExtraVanity+i*common.AddressLength:], auth.Bytes())
+		copy(header.Extra[clique.ExtraVanity+i*length.Addr:], auth.Bytes())
 	}
 }
 
 // address retrieves the Ethereum address of a tester account by label, creating
 // a new account if no previous one exists yet.
-func (ap *testerAccountPool) address(account string) common.Address {
+func (ap *testerAccountPool) address(account string) libcommon.Address {
 	// Return the zero account for non-addresses
 	if account == "" {
-		return common.Address{}
+		return libcommon.Address{}
 	}
 	// Ensure we have a persistent key for the account
 	if ap.accounts[account] == nil {
@@ -391,7 +394,7 @@ func TestClique(t *testing.T) {
 			// Create the account pool and generate the initial set of signers
 			accounts := newTesterAccountPool()
 
-			signers := make([]common.Address, len(tt.signers))
+			signers := make([]libcommon.Address, len(tt.signers))
 			for j, signer := range tt.signers {
 				signers[j] = accounts.address(signer)
 			}
@@ -403,17 +406,17 @@ func TestClique(t *testing.T) {
 				}
 			}
 			// Create the genesis block with the initial set of signers
-			genesis := &core.Genesis{
-				ExtraData: make([]byte, clique.ExtraVanity+common.AddressLength*len(signers)+clique.ExtraSeal),
+			genesis := &types.Genesis{
+				ExtraData: make([]byte, clique.ExtraVanity+length.Addr*len(signers)+clique.ExtraSeal),
 				Config:    params.AllCliqueProtocolChanges,
 			}
 			for j, signer := range signers {
-				copy(genesis.ExtraData[clique.ExtraVanity+j*common.AddressLength:], signer[:])
+				copy(genesis.ExtraData[clique.ExtraVanity+j*length.Addr:], signer[:])
 			}
 
 			// Assemble a chain of headers from the cast votes
 			config := *params.AllCliqueProtocolChanges
-			config.Clique = &params.CliqueConfig{
+			config.Clique = &chain.CliqueConfig{
 				Period: 1,
 				Epoch:  tt.epoch,
 			}
@@ -446,7 +449,7 @@ func TestClique(t *testing.T) {
 				}
 				header.Extra = make([]byte, clique.ExtraVanity+clique.ExtraSeal)
 				if auths := tt.votes[j].checkpoint; auths != nil {
-					header.Extra = make([]byte, clique.ExtraVanity+len(auths)*common.AddressLength+clique.ExtraSeal)
+					header.Extra = make([]byte, clique.ExtraVanity+len(auths)*length.Addr+clique.ExtraSeal)
 					accounts.checkpoint(header, auths)
 				}
 				header.Difficulty = clique.DiffInTurn // Ignored, we just need a valid number
@@ -502,8 +505,14 @@ func TestClique(t *testing.T) {
 			// No failure was produced or requested, generate the final voting snapshot
 			head := chain.Blocks[len(chain.Blocks)-1]
 
-			snap, err := engine.Snapshot(stagedsync.ChainReader{Cfg: config, Db: olddb.NewObjectDatabase(m.DB)}, head.NumberU64(), head.Hash(), nil)
-			if err != nil {
+			var snap *clique.Snapshot
+			if err := m.DB.View(context.Background(), func(tx kv.Tx) error {
+				snap, err = engine.Snapshot(stagedsync.ChainReader{Cfg: config, Db: tx}, head.NumberU64(), head.Hash(), nil)
+				if err != nil {
+					return err
+				}
+				return nil
+			}); err != nil {
 				t.Errorf("test %d: failed to retrieve voting snapshot %d(%s): %v",
 					i, head.NumberU64(), head.Hash().Hex(), err)
 				engine.Close()
@@ -511,7 +520,7 @@ func TestClique(t *testing.T) {
 			}
 
 			// Verify the final list of signers against the expected ones
-			signers = make([]common.Address, len(tt.results))
+			signers = make([]libcommon.Address, len(tt.results))
 			for j, signer := range tt.results {
 				signers[j] = accounts.address(signer)
 			}

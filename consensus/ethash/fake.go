@@ -4,11 +4,12 @@ import (
 	"time"
 
 	mapset "github.com/deckarep/golang-set"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon/consensus/ethash/ethashcfg"
+	"github.com/ledgerwatch/log/v3"
 
-	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/consensus"
 	"github.com/ledgerwatch/erigon/core/types"
-	"github.com/ledgerwatch/log/v3"
 )
 
 type FakeEthash struct {
@@ -22,7 +23,7 @@ type FakeEthash struct {
 // still have to conform to the Ethereum consensus rules.
 func NewFakeFailer(fail uint64) *FakeEthash {
 	return &FakeEthash{
-		Ethash:   newFakeEth(ModeFake),
+		Ethash:   newFakeEth(ethashcfg.ModeFake),
 		fakeFail: fail,
 	}
 }
@@ -32,7 +33,7 @@ func NewFakeFailer(fail uint64) *FakeEthash {
 // consensus rules.
 func NewFaker() *FakeEthash {
 	return &FakeEthash{
-		Ethash: newFakeEth(ModeFake),
+		Ethash: newFakeEth(ethashcfg.ModeFake),
 	}
 }
 
@@ -41,14 +42,14 @@ func NewFaker() *FakeEthash {
 // they still have to conform to the Ethereum consensus rules.
 func NewFakeDelayer(delay time.Duration) *FakeEthash {
 	return &FakeEthash{
-		Ethash:    newFakeEth(ModeFake),
+		Ethash:    newFakeEth(ethashcfg.ModeFake),
 		fakeDelay: delay,
 	}
 }
 
-func newFakeEth(mode Mode) Ethash {
+func newFakeEth(mode ethashcfg.Mode) Ethash {
 	return Ethash{
-		config: Config{
+		config: ethashcfg.Config{
 			PowMode: mode,
 			Log:     log.Root(),
 		},
@@ -86,7 +87,7 @@ func (f *FakeEthash) VerifyUncles(chain consensus.ChainReader, header *types.Hea
 	return nil
 }
 
-func (f *FakeEthash) VerifyUncle(chain consensus.ChainHeaderReader, block *types.Header, uncle *types.Header, uncles mapset.Set, ancestors map[common.Hash]*types.Header, seal bool) error {
+func (f *FakeEthash) VerifyUncle(chain consensus.ChainHeaderReader, block *types.Header, uncle *types.Header, uncles mapset.Set, ancestors map[libcommon.Hash]*types.Header, seal bool) error {
 	err := f.Ethash.VerifyUncle(chain, block, uncle, uncles, ancestors, false)
 	if err != nil {
 		return err
@@ -114,7 +115,7 @@ func (f *FakeEthash) VerifySeal(_ consensus.ChainHeaderReader, header *types.Hea
 // If we're running a fake PoW, simply return a 0 nonce immediately
 func (f *FakeEthash) Seal(_ consensus.ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
 	header := block.Header()
-	header.Nonce, header.MixDigest = types.BlockNonce{}, common.Hash{}
+	header.Nonce, header.MixDigest = types.BlockNonce{}, libcommon.Hash{}
 
 	select {
 	case results <- block.WithSeal(header):
@@ -132,8 +133,8 @@ type FullFakeEthash FakeEthash
 func NewFullFaker() *FullFakeEthash {
 	return &FullFakeEthash{
 		Ethash: Ethash{
-			config: Config{
-				PowMode: ModeFullFake,
+			config: ethashcfg.Config{
+				PowMode: ethashcfg.ModeFullFake,
 				Log:     log.Root(),
 			},
 		},

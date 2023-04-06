@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/ledgerwatch/erigon/core/rawdb"
 	"io"
 	"math/big"
 	"sort"
@@ -14,15 +13,20 @@ import (
 	"sync"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
+	"github.com/hashicorp/golang-lru/v2"
+	"github.com/ledgerwatch/erigon-lib/chain"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/common/length"
+
+	"github.com/ledgerwatch/erigon/core/rawdb"
+	"github.com/ledgerwatch/erigon/crypto/cryptopool"
+
 	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/log/v3"
-	"golang.org/x/crypto/sha3"
 	"golang.org/x/exp/slices"
 
 	"github.com/ledgerwatch/erigon/accounts/abi"
-	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/hexutil"
 	"github.com/ledgerwatch/erigon/common/math"
 	"github.com/ledgerwatch/erigon/common/u256"
@@ -45,14 +49,14 @@ const (
 	inMemorySnapshots  = 128  // Number of recent snapshots to keep in memory
 	inMemorySignatures = 4096 // Number of recent block signatures to keep in memory
 
-	checkpointInterval = 1024        // Number of blocks after which to save the snapshot to the database
+	CheckpointInterval = 1024        // Number of blocks after which to save the snapshot to the database
 	defaultEpochLength = uint64(100) // Default number of blocks of checkpoint to update validatorSet from contract
 
 	extraVanity      = 32 // Fixed number of extra-data prefix bytes reserved for signer vanity
 	extraSeal        = 65 // Fixed number of extra-data suffix bytes reserved for signer seal
 	nextForkHashSize = 4  // Fixed number of extra-data suffix bytes reserved for nextForkHash.
 
-	validatorBytesLength = common.AddressLength
+	validatorBytesLength = length.Addr
 	wiggleTime           = uint64(1) // second, Random delay (per signer) to allow concurrent signers
 	initialBackOffTime   = uint64(1) // second
 	processBackOffTime   = uint64(1) // second
@@ -67,7 +71,7 @@ var (
 	// 100 native token
 	maxSystemBalance = new(uint256.Int).Mul(uint256.NewInt(100), uint256.NewInt(params.Ether))
 
-	systemContracts = map[common.Address]struct{}{
+	systemContracts = map[libcommon.Address]struct{}{
 		systemcontracts.ValidatorContract:          {},
 		systemcontracts.SlashContract:              {},
 		systemcontracts.SystemRewardContract:       {},
@@ -143,27 +147,27 @@ var (
 
 // SignFn is a signer callback function to request a header to be signed by a
 // backing account.
-type SignFn func(validator common.Address, payload []byte, chainId *big.Int) ([]byte, error)
+type SignFn func(validator libcommon.Address, payload []byte, chainId *big.Int) ([]byte, error)
 
 // ecrecover extracts the Ethereum account address from a signed header.
-func ecrecover(header *types.Header, sigCache *lru.ARCCache, chainId *big.Int) (common.Address, error) {
+func ecrecover(header *types.Header, sigCache *lru.ARCCache[libcommon.Hash, libcommon.Address], chainId *big.Int) (libcommon.Address, error) {
 	// If the signature's already cached, return that
 	hash := header.Hash()
 	if address, known := sigCache.Get(hash); known {
-		return address.(common.Address), nil
+		return address, nil
 	}
 	// Retrieve the signature from the header extra-data
 	if len(header.Extra) < extraSeal {
-		return common.Address{}, errMissingSignature
+		return libcommon.Address{}, errMissingSignature
 	}
 	signature := header.Extra[len(header.Extra)-extraSeal:]
 
 	// Recover the public key and the Ethereum address
 	pubkey, err := crypto.Ecrecover(SealHash(header, chainId).Bytes(), signature)
 	if err != nil {
-		return common.Address{}, err
+		return libcommon.Address{}, err
 	}
-	var signer common.Address
+	var signer libcommon.Address
 	copy(signer[:], crypto.Keccak256(pubkey[1:])[12:])
 
 	sigCache.Add(hash, signer)
@@ -171,8 +175,10 @@ func ecrecover(header *types.Header, sigCache *lru.ARCCache, chainId *big.Int) (
 }
 
 // SealHash returns the hash of a block prior to it being sealed.
-func SealHash(header *types.Header, chainId *big.Int) (hash common.Hash) {
-	hasher := sha3.NewLegacyKeccak256()
+func SealHash(header *types.Header, chainId *big.Int) (hash libcommon.Hash) {
+	hasher := cryptopool.NewLegacyKeccak256()
+	defer cryptopool.ReturnToPoolKeccak256(hasher)
+
 	encodeSigHeader(hasher, header, chainId)
 	hasher.Sum(hash[:0])
 	return hash
@@ -216,34 +222,36 @@ func parliaRLP(header *types.Header, chainId *big.Int) []byte {
 }
 
 type Parlia struct {
-	chainConfig *params.ChainConfig  // Chain config
-	config      *params.ParliaConfig // Consensus engine configuration parameters for parlia consensus
-	genesisHash common.Hash
+	chainConfig *chain.Config       // Chain config
+	config      *chain.ParliaConfig // Consensus engine configuration parameters for parlia consensus
+	genesisHash libcommon.Hash
 	db          kv.RwDB // Database to store and retrieve snapshot checkpoints
 	chainDb     kv.RwDB
 
-	recentSnaps *lru.ARCCache // Snapshots for recent block to speed up
-	signatures  *lru.ARCCache // Signatures of recent blocks to speed up mining
+	recentSnaps *lru.ARCCache[libcommon.Hash, *Snapshot]         // Snapshots for recent block to speed up
+	signatures  *lru.ARCCache[libcommon.Hash, libcommon.Address] // Signatures of recent blocks to speed up mining
 
 	signer *types.Signer
 
-	val    common.Address // Ethereum address of the signing key
-	signFn SignFn         // Signer function to authorize hashes with
+	val    libcommon.Address // Ethereum address of the signing key
+	signFn SignFn            // Signer function to authorize hashes with
 
-	lock sync.RWMutex // Protects the signer fields
+	signerLock sync.RWMutex // Protects the signer fields
+
+	snapLock sync.RWMutex // Protects snapshots creation
 
 	validatorSetABI abi.ABI
 	slashABI        abi.ABI
 
 	// The fields below are for testing only
-	fakeDiff  bool     // Skip difficulty verifications
-	forks     []uint64 // Forks extracted from the chainConfig
-	snapshots *snapshotsync.RoSnapshots
+	fakeDiff               bool     // Skip difficulty verifications
+	heightForks, timeForks []uint64 // Forks extracted from the chainConfig
+	snapshots              *snapshotsync.RoSnapshots
 }
 
 // New creates a Parlia consensus engine.
 func New(
-	chainConfig *params.ChainConfig,
+	chainConfig *chain.Config,
 	db kv.RwDB,
 	snapshots *snapshotsync.RoSnapshots,
 	chainDb kv.RwDB,
@@ -257,11 +265,11 @@ func New(
 	}
 
 	// Allocate the snapshot caches and create the engine
-	recentSnaps, err := lru.NewARC(inMemorySnapshots)
+	recentSnaps, err := lru.NewARC[libcommon.Hash, *Snapshot](inMemorySnapshots)
 	if err != nil {
 		panic(err)
 	}
-	signatures, err := lru.NewARC(inMemorySignatures)
+	signatures, err := lru.NewARC[libcommon.Hash, libcommon.Address](inMemorySignatures)
 	if err != nil {
 		panic(err)
 	}
@@ -283,22 +291,23 @@ func New(
 		validatorSetABI: vABI,
 		slashABI:        sABI,
 		signer:          types.LatestSigner(chainConfig),
-		forks:           forkid.GatherForks(chainConfig),
 		snapshots:       snapshots,
 	}
+	c.heightForks, c.timeForks = forkid.GatherForks(chainConfig)
 
 	return c
 }
 
 // Type returns underlying consensus engine
-func (p *Parlia) Type() params.ConsensusType {
-	return params.ParliaConsensus
+func (p *Parlia) Type() chain.ConsensusName {
+	return chain.ParliaConsensus
 }
 
 // Author retrieves the Ethereum address of the account that minted the given
 // block, which may be different from the header's coinbase if a consensus
 // engine is based on signatures.
-func (p *Parlia) Author(header *types.Header) (common.Address, error) {
+// This is thread-safe (only access the header.Coinbase)
+func (p *Parlia) Author(header *types.Header) (libcommon.Address, error) {
 	return header.Coinbase, nil
 }
 
@@ -335,7 +344,7 @@ func (p *Parlia) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 
 	// Don't waste time checking blocks from the future
 	if header.Time > uint64(time.Now().Unix()) {
-		return consensus.ErrFutureBlock
+		return fmt.Errorf("header %d, time %d, now %d, %w", header.Number.Uint64(), header.Time, time.Now().Unix(), consensus.ErrFutureBlock)
 	}
 	// Check that the extra-data contains the vanity, validators and signature.
 	if len(header.Extra) < extraVanity {
@@ -358,7 +367,7 @@ func (p *Parlia) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 	}
 
 	// Ensure that the mix digest is zero as we don't have fork protection currently
-	if header.MixDigest != (common.Hash{}) {
+	if header.MixDigest != (libcommon.Hash{}) {
 		return errInvalidMixDigest
 	}
 	// Ensure that the block doesn't contain any uncles which are meaningless in PoA
@@ -371,10 +380,11 @@ func (p *Parlia) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 			return errInvalidDifficulty
 		}
 	}
-	// If all checks passed, validate any special fields for hard forks
-	if err := misc.VerifyForkHashes(chain.Config(), header, false); err != nil {
-		return err
+
+	if header.WithdrawalsHash != nil {
+		return consensus.ErrUnexpectedWithdrawals
 	}
+
 	// All basic checks passed, verify cascading fields
 	return p.verifyCascadingFields(chain, header, parents)
 }
@@ -463,7 +473,7 @@ func (p *Parlia) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 	}
 
 	if _, ok := snap.Validators[signer]; !ok {
-		return errUnauthorizedValidator
+		return fmt.Errorf("parlia.verifySeal: headerNum=%d, validator=%x, %w", header.Number.Uint64(), signer.Bytes(), errUnauthorizedValidator)
 	}
 
 	for seen, recent := range snap.Recents {
@@ -490,22 +500,31 @@ func (p *Parlia) verifySeal(chain consensus.ChainHeaderReader, header *types.Hea
 }
 
 // snapshot retrieves the authorization snapshot at a given point in time.
-func (p *Parlia) snapshot(chain consensus.ChainHeaderReader, number uint64, hash common.Hash, parents []*types.Header, verify bool) (*Snapshot, error) {
+func (p *Parlia) snapshot(chain consensus.ChainHeaderReader, number uint64, hash libcommon.Hash, parents []*types.Header, verify bool) (*Snapshot, error) {
 	// Search for a snapshot in memory or on disk for checkpoints
 	var (
 		headers []*types.Header
 		snap    *Snapshot
+		doLog   bool
 	)
+
+	if s, ok := p.recentSnaps.Get(hash); ok {
+		snap = s
+	} else {
+		p.snapLock.Lock()
+		defer p.snapLock.Unlock()
+		doLog = true
+	}
 
 	for snap == nil {
 		// If an in-memory snapshot was found, use that
 		if s, ok := p.recentSnaps.Get(hash); ok {
-			snap = s.(*Snapshot)
+			snap = s
 			break
 		}
 
 		// If an on-disk checkpoint snapshot can be found, use that
-		if number%checkpointInterval == 0 {
+		if number%CheckpointInterval == 0 {
 			if s, err := loadSnapshot(p.config, p.signatures, p.db, number, hash); err == nil {
 				//log.Trace("Loaded snapshot from disk", "number", number, "hash", hash)
 				snap = s
@@ -514,21 +533,22 @@ func (p *Parlia) snapshot(chain consensus.ChainHeaderReader, number uint64, hash
 				}
 			}
 		}
-		if (verify && number%p.config.Epoch == 0) || number == 0 {
-			if (p.snapshots != nil && number <= p.snapshots.BlocksAvailable()) || number == 0 {
-				// Headers included into the snapshots have to be trusted as checkpoints
-				checkpoint := chain.GetHeader(hash, number)
-				if checkpoint != nil {
-					validatorBytes := checkpoint.Extra[extraVanity : len(checkpoint.Extra)-extraSeal]
-					// get validators from headers
-					validators, err := ParseValidators(validatorBytes)
-					if err != nil {
-						return nil, err
-					}
-					// new snapshot
-					snap = newSnapshot(p.config, p.signatures, number, hash, validators)
-					break
+		if number == 0 {
+			// Headers included into the snapshots have to be trusted as checkpoints
+			checkpoint := chain.GetHeader(hash, number)
+			if checkpoint != nil {
+				validatorBytes := checkpoint.Extra[extraVanity : len(checkpoint.Extra)-extraSeal]
+				// get validators from headers
+				validators, err := ParseValidators(validatorBytes)
+				if err != nil {
+					return nil, err
 				}
+				// new snapshot
+				snap = newSnapshot(p.config, p.signatures, number, hash, validators)
+				if err := snap.store(p.db); err != nil {
+					return nil, err
+				}
+				break
 			}
 		}
 
@@ -542,7 +562,10 @@ func (p *Parlia) snapshot(chain consensus.ChainHeaderReader, number uint64, hash
 			}
 			parents = parents[:len(parents)-1]
 		} else {
-			// No explicit parents (or no more left), reach out to the database
+			if doLog && number%100_000 == 0 {
+				// No explicit parents (or no more left), reach out to the database
+				log.Info("[parlia] snapshots build, gather headers", "block", number)
+			}
 			header = chain.GetHeader(hash, number)
 			if header == nil {
 				return nil, consensus.ErrUnknownAncestor
@@ -561,14 +584,14 @@ func (p *Parlia) snapshot(chain consensus.ChainHeaderReader, number uint64, hash
 	for i := 0; i < len(headers)/2; i++ {
 		headers[i], headers[len(headers)-1-i] = headers[len(headers)-1-i], headers[i]
 	}
-	snap, err := snap.apply(headers, chain, parents, p.chainConfig.ChainID)
+	snap, err := snap.apply(headers, chain, parents, p.chainConfig.ChainID, doLog)
 	if err != nil {
 		return nil, err
 	}
 	p.recentSnaps.Add(snap.Hash, snap)
 
 	// If we've generated a new checkpoint snapshot, save to disk
-	if snap.Number%checkpointInterval == 0 && len(headers) > 0 {
+	if verify && snap.Number%CheckpointInterval == 0 && len(headers) > 0 {
 		if err = snap.store(p.db); err != nil {
 			return nil, err
 		}
@@ -598,21 +621,27 @@ func (p *Parlia) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 		return err
 	}
 
+	parent := chain.GetHeader(header.ParentHash, number-1)
+	if parent == nil {
+		return consensus.ErrUnknownAncestor
+	}
+
 	// Set the correct difficulty
 	header.Difficulty = CalcDifficulty(snap, p.val)
+
+	// Ensure the timestamp has the correct delay
+	header.Time = p.blockTimeForRamanujanFork(snap, header, parent)
+	if header.Time < uint64(time.Now().Unix()) {
+		header.Time = uint64(time.Now().Unix())
+	}
 
 	// Ensure the extra data has all it's components
 	if len(header.Extra) < extraVanity-nextForkHashSize {
 		header.Extra = append(header.Extra, bytes.Repeat([]byte{0x00}, extraVanity-nextForkHashSize-len(header.Extra))...)
 	}
 	header.Extra = header.Extra[:extraVanity-nextForkHashSize]
-	nextForkHash := forkid.NextForkHashFromForks(p.forks, p.genesisHash, number)
+	nextForkHash := forkid.NextForkHashFromForks(p.heightForks, p.timeForks, p.genesisHash, number, header.Time)
 	header.Extra = append(header.Extra, nextForkHash[:]...)
-
-	parent := chain.GetHeader(header.ParentHash, number-1)
-	if parent == nil {
-		return consensus.ErrUnknownAncestor
-	}
 
 	if number%p.config.Epoch == 0 {
 		newValidators, err := p.getCurrentValidators(parent, ibs)
@@ -630,21 +659,19 @@ func (p *Parlia) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 	header.Extra = append(header.Extra, make([]byte, extraSeal)...)
 
 	// Mix digest is reserved for now, set to empty
-	header.MixDigest = common.Hash{}
+	header.MixDigest = libcommon.Hash{}
 
-	// Ensure the timestamp has the correct delay
-	header.Time = p.blockTimeForRamanujanFork(snap, header, parent)
-	if header.Time < uint64(time.Now().Unix()) {
-		header.Time = uint64(time.Now().Unix())
-	}
 	return nil
 }
 
 // Initialize runs any pre-transaction state modifications (e.g. epoch start)
-func (p *Parlia) Initialize(config *params.ChainConfig, chain consensus.ChainHeaderReader, e consensus.EpochReader, header *types.Header, txs []types.Transaction, uncles []*types.Header, syscall consensus.SystemCall) {
+func (p *Parlia) Initialize(config *chain.Config, chain consensus.ChainHeaderReader, header *types.Header,
+	state *state.IntraBlockState, txs []types.Transaction, uncles []*types.Header, syscall consensus.SystemCall) {
 }
 
 func (p *Parlia) splitTxs(txs types.Transactions, header *types.Header) (userTxs types.Transactions, systemTxs types.Transactions, err error) {
+	userTxs = types.Transactions{}
+	systemTxs = types.Transactions{}
 	for _, tx := range txs {
 		isSystemTx, err2 := p.IsSystemTransaction(tx, header)
 		if err2 != nil {
@@ -657,12 +684,6 @@ func (p *Parlia) splitTxs(txs types.Transactions, header *types.Header) (userTxs
 			userTxs = append(userTxs, tx)
 		}
 	}
-	if userTxs == nil {
-		userTxs = types.Transactions{}
-	}
-	if systemTxs == nil {
-		systemTxs = types.Transactions{}
-	}
 	return
 }
 
@@ -671,8 +692,8 @@ func (p *Parlia) splitTxs(txs types.Transactions, header *types.Header) (userTxs
 //
 // Note: The block header and state database might be updated to reflect any
 // consensus rules that happen at finalization (e.g. block rewards).
-func (p *Parlia) Finalize(_ *params.ChainConfig, header *types.Header, state *state.IntraBlockState,
-	txs types.Transactions, _ []*types.Header, receipts types.Receipts, e consensus.EpochReader,
+func (p *Parlia) Finalize(_ *chain.Config, header *types.Header, state *state.IntraBlockState,
+	txs types.Transactions, _ []*types.Header, receipts types.Receipts, withdrawals []*types.Withdrawal,
 	chain consensus.ChainHeaderReader, syscall consensus.SystemCall,
 ) (types.Transactions, types.Receipts, error) {
 	return p.finalize(header, state, txs, receipts, chain, false)
@@ -742,16 +763,19 @@ func (p *Parlia) finalize(header *types.Header, state *state.IntraBlockState, tx
 			var receipt *types.Receipt
 			if systemTxs, tx, receipt, err = p.slash(spoiledVal, state, header, len(txs), systemTxs, &header.GasUsed, mining); err != nil {
 				// it is possible that slash validator failed because of the slash channel is disabled.
-				log.Error("slash validator failed", "block hash", header.Hash(), "address", spoiledVal)
+				log.Error("slash validator failed", "block hash", header.Hash(), "address", spoiledVal, "error", err)
 			} else {
 				txs = append(txs, tx)
 				receipts = append(receipts, receipt)
+				log.Debug("slash successful", "txns", txs.Len(), "receipts", len(receipts), "gasUsed", header.GasUsed)
 			}
 		}
 	}
 	if txs, systemTxs, receipts, err = p.distributeIncoming(header.Coinbase, state, header, txs, receipts, systemTxs, &header.GasUsed, mining); err != nil {
+		//log.Error("distributeIncoming", "block hash", header.Hash(), "error", err, "systemTxs", len(systemTxs))
 		return nil, nil, err
 	}
+	//log.Debug("distribute successful", "txns", txs.Len(), "receipts", len(receipts), "gasUsed", header.GasUsed)
 	if len(systemTxs) > 0 {
 		return nil, nil, fmt.Errorf("the length of systemTxs is still %d", len(systemTxs))
 	}
@@ -765,22 +789,22 @@ func (p *Parlia) finalize(header *types.Header, state *state.IntraBlockState, tx
 //
 // Note: The block header and state database might be updated to reflect any
 // consensus rules that happen at finalization (e.g. block rewards).
-func (p *Parlia) FinalizeAndAssemble(_ *params.ChainConfig, header *types.Header, state *state.IntraBlockState,
-	txs types.Transactions, _ []*types.Header, receipts types.Receipts, e consensus.EpochReader,
+func (p *Parlia) FinalizeAndAssemble(_ *chain.Config, header *types.Header, state *state.IntraBlockState,
+	txs types.Transactions, _ []*types.Header, receipts types.Receipts, withdrawals []*types.Withdrawal,
 	chain consensus.ChainHeaderReader, syscall consensus.SystemCall, call consensus.Call,
 ) (*types.Block, types.Transactions, types.Receipts, error) {
 	outTxs, outReceipts, err := p.finalize(header, state, txs, receipts, chain, true)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return types.NewBlock(header, outTxs, nil, outReceipts), outTxs, outReceipts, nil
+	return types.NewBlock(header, outTxs, nil, outReceipts, withdrawals), outTxs, outReceipts, nil
 }
 
 // Authorize injects a private key into the consensus engine to mint new blocks
 // with.
-func (p *Parlia) Authorize(val common.Address, signFn SignFn) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+func (p *Parlia) Authorize(val libcommon.Address, signFn SignFn) {
+	p.signerLock.Lock()
+	defer p.signerLock.Unlock()
 
 	p.val = val
 	p.signFn = signFn
@@ -805,9 +829,9 @@ func (p *Parlia) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		return nil
 	}
 	// Don't hold the val fields for the entire sealing procedure
-	p.lock.RLock()
+	p.signerLock.RLock()
 	val, signFn := p.val, p.signFn
-	p.lock.RUnlock()
+	p.signerLock.RUnlock()
 
 	snap, err := p.snapshot(chain, number-1, header.ParentHash, nil, false /* verify */)
 	if err != nil {
@@ -816,7 +840,7 @@ func (p *Parlia) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 
 	// Bail out if we're unauthorized to sign a block
 	if _, authorized := snap.Validators[val]; !authorized {
-		return errUnauthorizedValidator
+		return fmt.Errorf("parlia.Seal: %w", errUnauthorizedValidator)
 	}
 
 	// If we're amongst the recent signers, wait for the next block
@@ -833,7 +857,7 @@ func (p *Parlia) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	// Sweet, the protocol permits us to sign the block, wait for our time
 	delay := p.delayForRamanujanFork(snap, header)
 
-	log.Info("Sealing block with", "number", number, "delay", delay, "headerDifficulty", header.Difficulty, "val", val.Hex())
+	log.Info("Sealing block with", "number", number, "delay", delay, "headerDifficulty", header.Difficulty, "val", val.Hex(), "headerHash", header.Hash().Hex(), "gasUsed", header.GasUsed, "block txn number", block.Transactions().Len(), "State Root", header.Root)
 
 	// Sign all the things!
 	sig, err := signFn(val, crypto.Keccak256(parliaRLP(header, p.chainConfig.ChainID)), p.chainConfig.ChainID)
@@ -872,13 +896,13 @@ func (p *Parlia) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 }
 
 // SealHash returns the hash of a block prior to it being sealed.
-func (p *Parlia) SealHash(header *types.Header) common.Hash {
+func (p *Parlia) SealHash(header *types.Header) libcommon.Hash {
 	return SealHash(header, p.chainConfig.ChainID)
 }
 
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
 // that a new block should have.
-func (p *Parlia) CalcDifficulty(chain consensus.ChainHeaderReader, time, parentTime uint64, parentDifficulty *big.Int, parentNumber uint64, parentHash, parentUncleHash common.Hash, parentSeal []rlp.RawValue) *big.Int {
+func (p *Parlia) CalcDifficulty(chain consensus.ChainHeaderReader, time, parentTime uint64, parentDifficulty *big.Int, parentNumber uint64, parentHash, parentUncleHash libcommon.Hash, _ uint64) *big.Int {
 	snap, err := p.snapshot(chain, parentNumber, parentHash, nil, false /* verify */)
 	if err != nil {
 		return nil
@@ -889,14 +913,14 @@ func (p *Parlia) CalcDifficulty(chain consensus.ChainHeaderReader, time, parentT
 // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
 // that a new block should have based on the previous blocks in the chain and the
 // current signer.
-func CalcDifficulty(snap *Snapshot, signer common.Address) *big.Int {
+func CalcDifficulty(snap *Snapshot, signer libcommon.Address) *big.Int {
 	if snap.inturn(signer) {
 		return new(big.Int).Set(diffInTurn)
 	}
 	return new(big.Int).Set(diffNoTurn)
 }
 
-func (p *Parlia) GenerateSeal(chain consensus.ChainHeaderReader, current, parent *types.Header, call consensus.Call) []rlp.RawValue {
+func (p *Parlia) GenerateSeal(chain consensus.ChainHeaderReader, current, parent *types.Header, call consensus.Call) []byte {
 	return nil
 }
 
@@ -908,6 +932,10 @@ func (p *Parlia) APIs(chain consensus.ChainHeaderReader) []rpc.API {
 		Service:   &API{chain: chain, parlia: p},
 		Public:    false,
 	}}
+}
+
+func (p *Parlia) IsServiceTransaction(sender libcommon.Address, syscall consensus.SystemCall) bool {
+	return false
 }
 
 func (p *Parlia) IsSystemTransaction(tx types.Transaction, header *types.Header) (bool, error) {
@@ -925,12 +953,12 @@ func (p *Parlia) IsSystemTransaction(tx types.Transaction, header *types.Header)
 	return false, nil
 }
 
-func isToSystemContract(to common.Address) bool {
+func isToSystemContract(to libcommon.Address) bool {
 	_, ok := systemContracts[to]
 	return ok
 }
 
-func (p *Parlia) IsSystemContract(to *common.Address) bool {
+func (p *Parlia) IsSystemContract(to *libcommon.Address) bool {
 	if to == nil {
 		return false
 	}
@@ -992,7 +1020,7 @@ func (p *Parlia) Close() error {
 // ==========================  interaction with contract/account =========
 
 // getCurrentValidators get current validators
-func (p *Parlia) getCurrentValidators(header *types.Header, ibs *state.IntraBlockState) ([]common.Address, error) {
+func (p *Parlia) getCurrentValidators(header *types.Header, ibs *state.IntraBlockState) ([]libcommon.Address, error) {
 	// method
 	var method string
 	if p.chainConfig.IsEuler(header.Number) {
@@ -1011,12 +1039,12 @@ func (p *Parlia) getCurrentValidators(header *types.Header, ibs *state.IntraBloc
 	if err != nil {
 		return nil, err
 	}
-	var ret0 = new([]common.Address)
+	var ret0 = new([]libcommon.Address)
 	out := ret0
 	if err := p.validatorSetABI.UnpackIntoInterface(out, method, returnData); err != nil {
 		return nil, err
 	}
-	valz := make([]common.Address, len(*ret0))
+	valz := make([]libcommon.Address, len(*ret0))
 	copy(valz, *ret0)
 	//for i, a := range *ret0 {
 	//	valz[i] = a
@@ -1025,7 +1053,7 @@ func (p *Parlia) getCurrentValidators(header *types.Header, ibs *state.IntraBloc
 }
 
 // slash spoiled validators
-func (p *Parlia) distributeIncoming(val common.Address, state *state.IntraBlockState, header *types.Header,
+func (p *Parlia) distributeIncoming(val libcommon.Address, state *state.IntraBlockState, header *types.Header,
 	txs types.Transactions, receipts types.Receipts, systemTxs types.Transactions,
 	usedGas *uint64, mining bool,
 ) (types.Transactions, types.Transactions, types.Receipts, error) {
@@ -1067,7 +1095,7 @@ func (p *Parlia) distributeIncoming(val common.Address, state *state.IntraBlockS
 }
 
 // slash spoiled validators
-func (p *Parlia) slash(spoiledVal common.Address, state *state.IntraBlockState, header *types.Header,
+func (p *Parlia) slash(spoiledVal libcommon.Address, state *state.IntraBlockState, header *types.Header,
 	txIndex int, systemTxs types.Transactions, usedGas *uint64, mining bool,
 ) (types.Transactions, types.Transaction, *types.Receipt, error) {
 	// method
@@ -1093,7 +1121,7 @@ func (p *Parlia) initContract(state *state.IntraBlockState, header *types.Header
 	// method
 	method := "init"
 	// contracts
-	contracts := []common.Address{
+	contracts := []libcommon.Address{
 		systemcontracts.ValidatorContract,
 		systemcontracts.SlashContract,
 		systemcontracts.LightClientContract,
@@ -1130,7 +1158,7 @@ func (p *Parlia) distributeToSystem(amount *uint256.Int, state *state.IntraBlock
 }
 
 // slash spoiled validators
-func (p *Parlia) distributeToValidator(amount *uint256.Int, validator common.Address, state *state.IntraBlockState, header *types.Header,
+func (p *Parlia) distributeToValidator(amount *uint256.Int, validator libcommon.Address, state *state.IntraBlockState, header *types.Header,
 	txIndex int, systemTxs types.Transactions,
 	usedGas *uint64, mining bool,
 ) (types.Transactions, types.Transaction, *types.Receipt, error) {
@@ -1149,7 +1177,7 @@ func (p *Parlia) distributeToValidator(amount *uint256.Int, validator common.Add
 	return p.applyTransaction(header.Coinbase, systemcontracts.ValidatorContract, amount, data, state, header, txIndex, systemTxs, usedGas, mining)
 }
 
-func (p *Parlia) applyTransaction(from common.Address, to common.Address, value *uint256.Int, data []byte, ibs *state.IntraBlockState, header *types.Header,
+func (p *Parlia) applyTransaction(from libcommon.Address, to libcommon.Address, value *uint256.Int, data []byte, ibs *state.IntraBlockState, header *types.Header,
 	txIndex int, systemTxs types.Transactions, usedGas *uint64, mining bool,
 ) (types.Transactions, types.Transaction, *types.Receipt, error) {
 	nonce := ibs.GetNonce(from)
@@ -1166,8 +1194,11 @@ func (p *Parlia) applyTransaction(from common.Address, to common.Address, value 
 			return nil, nil, nil, err
 		}
 	} else {
-		if len(systemTxs) == 0 || systemTxs[0] == nil {
+		if len(systemTxs) == 0 {
 			return nil, nil, nil, fmt.Errorf("supposed to get a actual transaction, but get none")
+		}
+		if systemTxs[0] == nil {
+			return nil, nil, nil, fmt.Errorf("supposed to get a actual transaction, but get nil")
 		}
 		actualTx := systemTxs[0]
 		actualHash := actualTx.SigningHash(p.chainConfig.ChainID)
@@ -1193,7 +1224,7 @@ func (p *Parlia) applyTransaction(from common.Address, to common.Address, value 
 		// move to next
 		systemTxs = systemTxs[1:]
 	}
-	ibs.Prepare(expectedTx.Hash(), common.Hash{}, txIndex)
+	ibs.Prepare(expectedTx.Hash(), libcommon.Hash{}, txIndex)
 	gasUsed, _, err := p.systemCall(from, to, data, ibs, header, value)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1202,7 +1233,7 @@ func (p *Parlia) applyTransaction(from common.Address, to common.Address, value 
 	receipt := types.NewReceipt(false, *usedGas)
 	receipt.TxHash = expectedTx.Hash()
 	receipt.GasUsed = gasUsed
-	if err := ibs.FinalizeTx(p.chainConfig.Rules(header.Number.Uint64()), state.NewNoopWriter()); err != nil {
+	if err := ibs.FinalizeTx(p.chainConfig.Rules(header.Number.Uint64(), header.Time), state.NewNoopWriter()); err != nil {
 		return nil, nil, nil, err
 	}
 	// Set the receipt logs and create a bloom for filtering
@@ -1215,9 +1246,9 @@ func (p *Parlia) applyTransaction(from common.Address, to common.Address, value 
 	return systemTxs, expectedTx, receipt, nil
 }
 
-func (p *Parlia) systemCall(from, contract common.Address, data []byte, ibs *state.IntraBlockState, header *types.Header, value *uint256.Int) (gasUsed uint64, returnData []byte, err error) {
+func (p *Parlia) systemCall(from, contract libcommon.Address, data []byte, ibs *state.IntraBlockState, header *types.Header, value *uint256.Int) (gasUsed uint64, returnData []byte, err error) {
 	chainConfig := p.chainConfig
-	if chainConfig.DAOForkSupport && chainConfig.DAOForkBlock != nil && chainConfig.DAOForkBlock.Cmp(header.Number) == 0 {
+	if chainConfig.DAOForkBlock != nil && chainConfig.DAOForkBlock.Cmp(header.Number) == 0 {
 		misc.ApplyDAOHardFork(ibs)
 	}
 	msg := types.NewMessage(
@@ -1227,10 +1258,11 @@ func (p *Parlia) systemCall(from, contract common.Address, data []byte, ibs *sta
 		math.MaxUint64/2, u256.Num0,
 		nil, nil,
 		data, nil, false,
+		true, // isFree
 	)
 	vmConfig := vm.Config{NoReceipts: true}
 	// Create a new context to be used in the EVM environment
-	blockContext := core.NewEVMBlockContext(header, core.GetHashFn(header, nil), p, &from, nil)
+	blockContext := core.NewEVMBlockContext(header, core.GetHashFn(header, nil), p, &from, nil /*excessDataGas*/)
 	evm := vm.NewEVM(blockContext, core.NewEVMTxContext(msg), ibs, chainConfig, vmConfig)
 	ret, leftOverGas, err := evm.Call(
 		vm.AccountRef(msg.From()),

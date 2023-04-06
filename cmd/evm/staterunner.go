@@ -22,16 +22,20 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
-	"github.com/ledgerwatch/erigon-lib/kv/memdb"
-	"github.com/ledgerwatch/erigon/common"
+	"github.com/c2h5oh/datasize"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/kv/mdbx"
+	"github.com/ledgerwatch/log/v3"
+	mdbx2 "github.com/torquem-ch/mdbx-go/mdbx"
+	"github.com/urfave/cli/v2"
+
 	"github.com/ledgerwatch/erigon/core/state"
 	"github.com/ledgerwatch/erigon/core/vm"
-	"github.com/ledgerwatch/erigon/params"
+	"github.com/ledgerwatch/erigon/eth/tracers/logger"
 	"github.com/ledgerwatch/erigon/tests"
 	"github.com/ledgerwatch/erigon/turbo/trie"
-	"github.com/ledgerwatch/log/v3"
-	"github.com/urfave/cli"
 )
 
 var stateTestCommand = cli.Command{
@@ -44,11 +48,12 @@ var stateTestCommand = cli.Command{
 // StatetestResult contains the execution status after running a state test, any
 // error that might have occurred and a dump of the final state if requested.
 type StatetestResult struct {
-	Name  string      `json:"name"`
-	Pass  bool        `json:"pass"`
-	Fork  string      `json:"fork"`
-	Error string      `json:"error,omitempty"`
-	State *state.Dump `json:"state,omitempty"`
+	Name  string          `json:"name"`
+	Pass  bool            `json:"pass"`
+	Root  *libcommon.Hash `json:"stateRoot,omitempty"`
+	Fork  string          `json:"fork"`
+	Error string          `json:"error,omitempty"`
+	State *state.Dump     `json:"state,omitempty"`
 }
 
 func stateTestCmd(ctx *cli.Context) error {
@@ -56,31 +61,29 @@ func stateTestCmd(ctx *cli.Context) error {
 		return errors.New("path-to-test argument required")
 	}
 	// Configure the go-ethereum logger
-	log.Root().SetHandler(log.LvlFilterHandler(log.LvlInfo, log.StderrHandler))
-	//glogger := log.NewGlogHandler(log.StreamHandler(os.Stderr, log.TerminalFormat(false)))
-	//glogger.Verbosity(log.Lvl(ctx.GlobalInt(VerbosityFlag.Name)))
+	log.Root().SetHandler(log.LvlFilterHandler(log.LvlDebug, log.StderrHandler))
 
 	// Configure the EVM logger
-	config := &vm.LogConfig{
-		DisableMemory:     ctx.GlobalBool(DisableMemoryFlag.Name),
-		DisableStack:      ctx.GlobalBool(DisableStackFlag.Name),
-		DisableStorage:    ctx.GlobalBool(DisableStorageFlag.Name),
-		DisableReturnData: ctx.GlobalBool(DisableReturnDataFlag.Name),
+	config := &logger.LogConfig{
+		DisableMemory:     ctx.Bool(DisableMemoryFlag.Name),
+		DisableStack:      ctx.Bool(DisableStackFlag.Name),
+		DisableStorage:    ctx.Bool(DisableStorageFlag.Name),
+		DisableReturnData: ctx.Bool(DisableReturnDataFlag.Name),
 	}
 	var (
-		tracer   vm.Tracer
-		debugger *vm.StructLogger
+		tracer   vm.EVMLogger
+		debugger *logger.StructLogger
 	)
 	switch {
-	case ctx.GlobalBool(MachineFlag.Name):
-		tracer = vm.NewJSONLogger(config, os.Stderr)
+	case ctx.Bool(MachineFlag.Name):
+		tracer = logger.NewJSONLogger(config, os.Stderr)
 
-	case ctx.GlobalBool(DebugFlag.Name):
-		debugger = vm.NewStructLogger(config)
+	case ctx.Bool(DebugFlag.Name):
+		debugger = logger.NewStructLogger(config)
 		tracer = debugger
 
 	default:
-		debugger = vm.NewStructLogger(config)
+		debugger = logger.NewStructLogger(config)
 	}
 	// Load the test content from the input file
 	src, err := os.ReadFile(ctx.Args().First())
@@ -93,8 +96,8 @@ func stateTestCmd(ctx *cli.Context) error {
 	}
 
 	// Iterate over all the stateTests, run them and aggregate the results
-	results := make([]StatetestResult, 0, len(stateTests))
-	if err := aggregateResultsFromStateTests(ctx, stateTests, results, tracer, debugger); err != nil {
+	results, err := aggregateResultsFromStateTests(ctx, stateTests, tracer, debugger)
+	if err != nil {
 		return err
 	}
 
@@ -106,34 +109,43 @@ func stateTestCmd(ctx *cli.Context) error {
 func aggregateResultsFromStateTests(
 	ctx *cli.Context,
 	stateTests map[string]tests.StateTest,
-	results []StatetestResult,
-	tracer vm.Tracer,
-	debugger *vm.StructLogger,
-) error {
+	tracer vm.EVMLogger,
+	debugger *logger.StructLogger,
+) ([]StatetestResult, error) {
 	// Iterate over all the stateTests, run them and aggregate the results
 	cfg := vm.Config{
 		Tracer: tracer,
-		Debug:  ctx.GlobalBool(DebugFlag.Name) || ctx.GlobalBool(MachineFlag.Name),
+		Debug:  ctx.Bool(DebugFlag.Name) || ctx.Bool(MachineFlag.Name),
 	}
 
-	db := memdb.New()
+	//this DB is shared. means:
+	// - faster sequential tests: don't need create/delete db
+	// - less parallelism: multiple processes can open same DB but only 1 can create rw-transaction (other will wait when 1-st finish)
+	db := mdbx.NewMDBX(log.New()).
+		Path(filepath.Join(os.TempDir(), "erigon-statetest")).
+		Flags(func(u uint) uint {
+			return u | mdbx2.UtterlyNoSync | mdbx2.NoMetaSync | mdbx2.LifoReclaim | mdbx2.NoMemInit
+		}).
+		GrowthStep(1 * datasize.MB).
+		MustOpen()
 	defer db.Close()
 
 	tx, txErr := db.BeginRw(context.Background())
 	if txErr != nil {
-		return txErr
+		return nil, txErr
 	}
 	defer tx.Rollback()
+	results := make([]StatetestResult, 0, len(stateTests))
 
 	for key, test := range stateTests {
 		for _, st := range test.Subtests() {
 			// Run the test and aggregate the result
 			result := &StatetestResult{Name: key, Fork: st.Fork, Pass: true}
 
-			var root common.Hash
+			var root libcommon.Hash
 			var calcRootErr error
 
-			statedb, err := test.Run(&params.Rules{}, tx, st, cfg)
+			statedb, err := test.Run(tx, st, cfg)
 			// print state root for evmlab tracing
 			root, calcRootErr = trie.CalcRoot("", tx)
 			if err == nil && calcRootErr != nil {
@@ -159,26 +171,28 @@ func aggregateResultsFromStateTests(
 			*/
 
 			// print state root for evmlab tracing
-			if ctx.GlobalBool(MachineFlag.Name) && statedb != nil {
-				_, printErr := fmt.Fprintf(os.Stderr, "{\"stateRoot\": \"%x\"}\n", root.Bytes())
-				if printErr != nil {
-					log.Warn("Failed to write to stderr", "err", printErr)
+			if statedb != nil {
+				result.Root = &root
+				if ctx.Bool(MachineFlag.Name) {
+					_, printErr := fmt.Fprintf(os.Stderr, "{\"stateRoot\": \"%#x\"}\n", root.Bytes())
+					if printErr != nil {
+						log.Warn("Failed to write to stderr", "err", printErr)
+					}
 				}
 			}
-
 			results = append(results, *result)
 
 			// Print any structured logs collected
-			if ctx.GlobalBool(DebugFlag.Name) {
+			if ctx.Bool(DebugFlag.Name) {
 				if debugger != nil {
 					_, printErr := fmt.Fprintln(os.Stderr, "#### TRACE ####")
 					if printErr != nil {
 						log.Warn("Failed to write to stderr", "err", printErr)
 					}
-					vm.WriteTrace(os.Stderr, debugger.StructLogs())
+					logger.WriteTrace(os.Stderr, debugger.StructLogs())
 				}
 			}
 		}
 	}
-	return nil
+	return results, nil
 }

@@ -4,18 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math/bits"
+	"sync/atomic"
 	"time"
 
+	"github.com/ledgerwatch/erigon-lib/common/length"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/hexutil"
 	"github.com/ledgerwatch/erigon/common/math"
 	"github.com/ledgerwatch/erigon/ethdb"
 	"github.com/ledgerwatch/erigon/turbo/trie"
 	"github.com/ledgerwatch/log/v3"
-	"go.uber.org/atomic"
 )
 
 // AssertSubset a & b == a - checks whether a is subset of b
@@ -42,7 +43,8 @@ func Trie(db kv.RoDB, tx kv.Tx, slowChecks bool, ctx context.Context) {
 			panic(err)
 		}
 		defer c.Close()
-		kv.ReadAhead(readAheadCtx, db, atomic.NewBool(false), kv.TrieOfAccounts, nil, math.MaxInt32)
+		clear := kv.ReadAhead(readAheadCtx, db, &atomic.Bool{}, kv.TrieOfAccounts, nil, math.MaxInt32)
+		defer clear()
 
 		trieAcc2, err := tx.Cursor(kv.TrieOfAccounts)
 		if err != nil {
@@ -55,7 +57,8 @@ func Trie(db kv.RoDB, tx kv.Tx, slowChecks bool, ctx context.Context) {
 			panic(err)
 		}
 		defer accC.Close()
-		kv.ReadAhead(readAheadCtx, db, atomic.NewBool(false), kv.HashedAccounts, nil, math.MaxInt32)
+		clear2 := kv.ReadAhead(readAheadCtx, db, &atomic.Bool{}, kv.HashedAccounts, nil, math.MaxInt32)
+		defer clear2()
 
 		for k, v, errc := c.First(); k != nil; k, v, errc = c.Next() {
 			if errc != nil {
@@ -66,14 +69,14 @@ func Trie(db kv.RoDB, tx kv.Tx, slowChecks bool, ctx context.Context) {
 			case <-quit:
 				return
 			case <-logEvery.C:
-				log.Info("trie account integrity", "key", fmt.Sprintf("%x", k))
+				log.Info("trie account integrity", "key", hex.EncodeToString(k))
 			}
 
 			hasState, hasTree, hasHash, hashes, _ := trie.UnmarshalTrieNode(v)
 			AssertSubset(k, hasTree, hasState)
 			AssertSubset(k, hasHash, hasState)
-			if bits.OnesCount16(hasHash) != len(hashes)/common.HashLength {
-				panic(fmt.Errorf("invariant bits.OnesCount16(hasHash) == len(hashes) failed: %d, %d", bits.OnesCount16(hasHash), len(v[6:])/common.HashLength))
+			if bits.OnesCount16(hasHash) != len(hashes)/length.Hash {
+				panic(fmt.Errorf("invariant bits.OnesCount16(hasHash) == len(hashes) failed: %d, %d", bits.OnesCount16(hasHash), len(v[6:])/length.Hash))
 			}
 			found := false
 			var parentK []byte
@@ -156,7 +159,8 @@ func Trie(db kv.RoDB, tx kv.Tx, slowChecks bool, ctx context.Context) {
 			panic(err)
 		}
 		defer c.Close()
-		kv.ReadAhead(readAheadCtx, db, atomic.NewBool(false), kv.TrieOfStorage, nil, math.MaxInt32)
+		clear := kv.ReadAhead(readAheadCtx, db, &atomic.Bool{}, kv.TrieOfStorage, nil, math.MaxInt32)
+		defer clear()
 
 		trieStorage, err := tx.Cursor(kv.TrieOfStorage)
 		if err != nil {
@@ -169,7 +173,8 @@ func Trie(db kv.RoDB, tx kv.Tx, slowChecks bool, ctx context.Context) {
 			panic(err)
 		}
 		defer storageC.Close()
-		kv.ReadAhead(readAheadCtx, db, atomic.NewBool(false), kv.HashedStorage, nil, math.MaxInt32)
+		clear2 := kv.ReadAhead(readAheadCtx, db, &atomic.Bool{}, kv.HashedStorage, nil, math.MaxInt32)
+		defer clear2()
 
 		for k, v, errc := c.First(); k != nil; k, v, errc = c.Next() {
 			if errc != nil {
@@ -180,14 +185,14 @@ func Trie(db kv.RoDB, tx kv.Tx, slowChecks bool, ctx context.Context) {
 			case <-quit:
 				return
 			case <-logEvery.C:
-				log.Info("trie storage integrity", "key", fmt.Sprintf("%x", k))
+				log.Info("trie storage integrity", "key", hex.EncodeToString(k))
 			}
 
 			hasState, hasTree, hasHash, hashes, _ := trie.UnmarshalTrieNode(v)
 			AssertSubset(k, hasTree, hasState)
 			AssertSubset(k, hasHash, hasState)
-			if bits.OnesCount16(hasHash) != len(hashes)/common.HashLength {
-				panic(fmt.Errorf("invariant bits.OnesCount16(hasHash) == len(hashes) failed: %d, %d", bits.OnesCount16(hasHash), len(hashes)/common.HashLength))
+			if bits.OnesCount16(hasHash) != len(hashes)/length.Hash {
+				panic(fmt.Errorf("invariant bits.OnesCount16(hasHash) == len(hashes) failed: %d, %d", bits.OnesCount16(hasHash), len(hashes)/length.Hash))
 			}
 
 			found := false

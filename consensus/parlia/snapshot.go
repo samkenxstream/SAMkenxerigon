@@ -19,27 +19,28 @@ package parlia
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"sort"
 
+	"github.com/hashicorp/golang-lru/v2"
+	"github.com/ledgerwatch/erigon-lib/chain"
+	"github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/common/hexutility"
 	"github.com/ledgerwatch/erigon-lib/kv"
+	"github.com/ledgerwatch/log/v3"
 
-	lru "github.com/hashicorp/golang-lru"
-
-	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/consensus"
 	"github.com/ledgerwatch/erigon/core/types"
-	"github.com/ledgerwatch/erigon/params"
 )
 
 // Snapshot is the state of the validatorSet at a given point.
 type Snapshot struct {
-	config   *params.ParliaConfig // Consensus engine parameters to fine tune behavior
-	sigCache *lru.ARCCache        // Cache of recent block signatures to speed up ecrecover
+	config   *chain.ParliaConfig                        // Consensus engine parameters to fine tune behavior
+	sigCache *lru.ARCCache[common.Hash, common.Address] // Cache of recent block signatures to speed up ecrecover
 
 	Number           uint64                      `json:"number"`             // Block number where the snapshot was created
 	Hash             common.Hash                 `json:"hash"`               // Block hash where the snapshot was created
@@ -52,8 +53,8 @@ type Snapshot struct {
 // method does not initialize the set of recent validators, so only ever use it for
 // the genesis block.
 func newSnapshot(
-	config *params.ParliaConfig,
-	sigCache *lru.ARCCache,
+	config *chain.ParliaConfig,
+	sigCache *lru.ARCCache[common.Hash, common.Address],
 	number uint64,
 	hash common.Hash,
 	validators []common.Address,
@@ -80,22 +81,15 @@ func (s validatorsAscending) Len() int           { return len(s) }
 func (s validatorsAscending) Less(i, j int) bool { return bytes.Compare(s[i][:], s[j][:]) < 0 }
 func (s validatorsAscending) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
-const NumberLength = 8
-
-// EncodeBlockNumber encodes a block number as big endian uint64
-func EncodeBlockNumber(number uint64) []byte {
-	enc := make([]byte, NumberLength)
-	binary.BigEndian.PutUint64(enc, number)
-	return enc
-}
-
 // SnapshotFullKey = SnapshotBucket + num (uint64 big endian) + hash
 func SnapshotFullKey(number uint64, hash common.Hash) []byte {
-	return append(EncodeBlockNumber(number), hash.Bytes()...)
+	return append(hexutility.EncodeTs(number), hash.Bytes()...)
 }
 
+var ErrNoSnapsnot = fmt.Errorf("no parlia snapshot")
+
 // loadSnapshot loads an existing snapshot from the database.
-func loadSnapshot(config *params.ParliaConfig, sigCache *lru.ARCCache, db kv.RwDB, num uint64, hash common.Hash) (*Snapshot, error) {
+func loadSnapshot(config *chain.ParliaConfig, sigCache *lru.ARCCache[common.Hash, common.Address], db kv.RwDB, num uint64, hash common.Hash) (*Snapshot, error) {
 	tx, err := db.BeginRo(context.Background())
 	if err != nil {
 		return nil, err
@@ -104,6 +98,10 @@ func loadSnapshot(config *params.ParliaConfig, sigCache *lru.ARCCache, db kv.RwD
 	blob, err := tx.GetOne(kv.ParliaSnapshot, SnapshotFullKey(num, hash))
 	if err != nil {
 		return nil, err
+	}
+
+	if len(blob) == 0 {
+		return nil, ErrNoSnapsnot
 	}
 	snap := new(Snapshot)
 	if err := json.Unmarshal(blob, snap); err != nil {
@@ -120,7 +118,7 @@ func (s *Snapshot) store(db kv.RwDB) error {
 	if err != nil {
 		return err
 	}
-	return db.Update(context.Background(), func(tx kv.RwTx) error {
+	return db.UpdateNosync(context.Background(), func(tx kv.RwTx) error {
 		return tx.Put(kv.ParliaSnapshot, SnapshotFullKey(s.Number, s.Hash), blob)
 	})
 }
@@ -160,7 +158,7 @@ func (s *Snapshot) isMajorityFork(forkHash string) bool {
 	return ally > len(s.RecentForkHashes)/2
 }
 
-func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderReader, parents []*types.Header, chainId *big.Int) (*Snapshot, error) {
+func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderReader, parents []*types.Header, chainId *big.Int, doLog bool) (*Snapshot, error) {
 	// Allow passing in no headers for cleaner code
 	if len(headers) == 0 {
 		return s, nil
@@ -185,6 +183,9 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 
 	for _, header := range headers {
 		number := header.Number.Uint64()
+		if doLog && number%100_000 == 0 {
+			log.Info("[parlia] snapshots build, recover from headers", "block", number)
+		}
 		// Delete the oldest validator from the recent list to allow it signing again
 		if limit := uint64(len(snap.Validators)/2 + 1); number >= limit {
 			delete(snap.Recents, number-limit)
@@ -197,9 +198,13 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 		if err != nil {
 			return nil, err
 		}
-		if _, ok := snap.Validators[validator]; !ok {
-			return nil, errUnauthorizedValidator
-		}
+		// Disabling this validation due to issues with BEP-131 looks like is breaks the property that used to allow Erigon to sync Parlia without knowning the contract state
+		// Further investigation is required
+		/*
+			if _, ok := snap.Validators[validator]; !ok {
+				return nil, errUnauthorizedValidator
+			}
+		*/
 		for _, recent := range snap.Recents {
 			if recent == validator {
 				return nil, errRecentlySigned
