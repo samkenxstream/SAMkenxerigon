@@ -206,7 +206,6 @@ type Config struct {
 
 	Clique params.ConsensusSnapshotConfig
 	Aura   chain.AuRaConfig
-	Parlia chain.ParliaConfig
 	Bor    chain.BorConfig
 
 	// Transaction pool options
@@ -242,7 +241,7 @@ type Config struct {
 	// Ethstats service
 	Ethstats string
 	// Consensus layer
-	ExternalCL                  bool
+	InternalCL                  bool
 	LightClientDiscoveryAddr    string
 	LightClientDiscoveryPort    uint64
 	LightClientDiscoveryTCPPort uint64

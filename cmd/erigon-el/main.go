@@ -34,7 +34,7 @@ func main() {
 		os.Exit(1)
 	}()
 
-	app := erigonapp.MakeApp(runErigon, erigoncli.DefaultFlags)
+	app := erigonapp.MakeApp("erigon-el", runErigon, erigoncli.DefaultFlags)
 	if err := app.Run(os.Args); err != nil {
 		_, printErr := fmt.Fprintln(os.Stderr, err)
 		if printErr != nil {
@@ -52,7 +52,7 @@ func runErigon(cliCtx *cli.Context) error {
 		}
 	}
 
-	logger := logging.GetLoggerCtx("erigon", cliCtx)
+	logger := logging.SetupLoggerCtx("erigon", cliCtx, true /* rootLogger */)
 
 	// initializing the node and providing the current git commit there
 	logger.Info("Build info", "git_branch", params.GitBranch, "git_tag", params.GitTag, "git_commit", params.GitCommit)
@@ -62,12 +62,12 @@ func runErigon(cliCtx *cli.Context) error {
 
 	ethNode, err := backend.NewNode(nodeCfg, ethCfg, logger)
 	if err != nil {
-		log.Error("Erigon startup", "err", err)
+		logger.Error("Erigon startup", "err", err)
 		return err
 	}
 	err = ethNode.Serve()
 	if err != nil {
-		log.Error("error while serving an Erigon node", "err", err)
+		logger.Error("error while serving an Erigon node", "err", err)
 	}
 	return err
 }

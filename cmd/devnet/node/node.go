@@ -15,6 +15,7 @@ import (
 	"github.com/ledgerwatch/erigon/params"
 	erigonapp "github.com/ledgerwatch/erigon/turbo/app"
 	erigoncli "github.com/ledgerwatch/erigon/turbo/cli"
+	"github.com/ledgerwatch/erigon/turbo/debug"
 	"github.com/ledgerwatch/erigon/turbo/node"
 	"github.com/ledgerwatch/log/v3"
 )
@@ -64,7 +65,7 @@ func StartNode(wg *sync.WaitGroup, args []string) {
 		os.Exit(1)
 	}()
 
-	app := erigonapp.MakeApp(runNode, erigoncli.DefaultFlags)
+	app := erigonapp.MakeApp("devnet", runNode, erigoncli.DefaultFlags)
 	nodeNumber++ // increment the number of nodes on the network
 	if err := app.Run(args); err != nil {
 		_, printErr := fmt.Fprintln(os.Stderr, err)
@@ -78,9 +79,13 @@ func StartNode(wg *sync.WaitGroup, args []string) {
 
 // runNode configures, creates and serves an erigon node
 func runNode(ctx *cli.Context) error {
-	logger := log.New()
-
 	// Initializing the node and providing the current git commit there
+
+	var logger log.Logger
+	var err error
+	if logger, err = debug.Setup(ctx, false /* rootLogger */); err != nil {
+		return err
+	}
 	logger.Info("Build info", "git_branch", params.GitBranch, "git_tag", params.GitTag, "git_commit", params.GitCommit)
 
 	nodeCfg := node.NewNodConfigUrfave(ctx)
@@ -94,7 +99,7 @@ func runNode(ctx *cli.Context) error {
 
 	err = ethNode.Serve()
 	if err != nil {
-		log.Error("error while serving Devnet node", "err", err)
+		logger.Error("error while serving Devnet node", "err", err)
 	}
 	return err
 }
